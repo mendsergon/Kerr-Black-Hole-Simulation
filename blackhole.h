@@ -46,6 +46,12 @@ struct Camera {
     float phi;          // Azimuthal angle (radians in XZ plane)
     float fov;          // Field of view in degrees
 
+    // Smooth interpolation targets (inputs go here, actual values lerp toward them)
+    float targetDistance;
+    float targetTheta;
+    float targetPhi;
+    float targetFov;
+
     // Mouse interaction state
     double lastMouseX;
     double lastMouseY;
@@ -67,25 +73,34 @@ public:
     // Clean up all OpenCL resources
     void cleanup();
 
-    // Render a frame — traces all rays on GPU, writes to pixel buffer
-    void renderFrame(const Camera& camera, int width, int height);
+    // Trace geodesics — writes geometry buffer (expensive, call on camera change only)
+    void traceGeometry(const Camera& camera, int width, int height);
 
-    // Get pointer to rendered pixel data (RGBA float4)
-    const std::vector<float>& getPixels() const { return m_pixels; }
+    // Shade from cached geometry — reads g-buffer, writes pixels (cheap, call every frame)
+    void shadeFrame(int width, int height, float simTime);
+
+    // Get mutable reference to pixel data (avoid copying every frame)
+    std::vector<float>& getPixels() { return m_pixels; }
 
     // Check if GPU acceleration is available
     bool isAvailable() const { return m_initialized; }
+
+    // Check if g-buffer is valid for current dimensions
+    bool hasGeometry() const { return m_gbufValid; }
 
     // Get device info string for display
     std::string getDeviceInfo() const { return m_deviceInfo; }
 
     // Get last frame render time in milliseconds
-    double getLastFrameTimeMs() const { return m_lastFrameTimeMs; }
+    double getLastTraceTimeMs() const { return m_lastTraceTimeMs; }
+    double getLastShadeTimeMs() const { return m_lastShadeTimeMs; }
 
 private:
     bool m_initialized;
+    bool m_gbufValid;
     std::string m_deviceInfo;
-    double m_lastFrameTimeMs;
+    double m_lastTraceTimeMs;
+    double m_lastShadeTimeMs;
 
     // Rendered pixel data (RGBA, width * height * 4 floats)
     std::vector<float> m_pixels;
@@ -97,10 +112,12 @@ private:
     cl_command_queue m_queue;
     cl_program m_program;
 
-    // Kernels
-    cl_kernel m_raytraceKernel;
+    // Kernels — two-pass architecture
+    cl_kernel m_traceKernel;   // Heavy: geodesic integration → g-buffer
+    cl_kernel m_shadeKernel;   // Light: g-buffer → pixel colors
 
     // Buffers
+    cl_mem m_gbufBuffer;   // Geometry buffer: 4 float4s per pixel
     cl_mem m_pixelBuffer;  // Output: RGBA float4 per pixel
     int m_bufferWidth;
     int m_bufferHeight;
@@ -118,7 +135,7 @@ private:
 // ============================================================================
 
 // Trace all rays on CPU when GPU is unavailable
-void renderFrameCPU(const Camera& camera, int width, int height, std::vector<float>& pixels);
+void renderFrameCPU(const Camera& camera, int width, int height, std::vector<float>& pixels, float simTime);
 
 // ============================================================================
 // Global GPU Ray Tracer Instance
@@ -132,5 +149,9 @@ extern GPURayTracer g_tracer;
 
 // Create default camera positioned to see the full lensing effect
 Camera createDefaultCamera();
+
+// Post-processing: bloom glow and gamma correction
+void applyBloom(std::vector<float>& pixels, int width, int height);
+void applyGammaCorrection(std::vector<float>& pixels);
 
 #endif // BLACKHOLE_H

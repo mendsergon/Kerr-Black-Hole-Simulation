@@ -11,15 +11,21 @@
 // ============================================================================
 
 Camera g_camera;
-bool g_needsRedraw = true;
 int g_renderWidth = RENDER_WIDTH;
 int g_renderHeight = RENDER_HEIGHT;
 std::vector<float> g_pixels;
 GLuint g_texture = 0;
 
-// Render resolution scale (1.0 = full, 0.5 = half for interactive dragging)
-float g_renderScale = 1.0f;
-bool g_highQueuedRender = false;
+// Simulation time — accumulates every frame for disk rotation
+float g_simTime = 0.0f;
+float g_simSpeed = 15.0f;  // Time units per real second (fast enough to see rotation)
+
+// Camera smoothing factor (0 = no smoothing, 1 = frozen)
+const float CAM_SMOOTH = 0.12f;
+
+// High-quality render state
+float g_settledTime = 0.0f;       // How long camera has been still
+bool g_hqRendered = false;         // Whether we've done a high-quality frame since last move
 
 // ============================================================================
 // Callbacks
@@ -27,10 +33,12 @@ bool g_highQueuedRender = false;
 
 // Window resize
 void framebuffer_size_callback([[maybe_unused]] GLFWwindow* window, int width, int height) {
+    if (width <= 0 || height <= 0) return;  // Minimized window
     glViewport(0, 0, width, height);
     g_renderWidth = width;
     g_renderHeight = height;
-    g_needsRedraw = true;
+    g_hqRendered = false;   // Force retrace at new resolution
+    g_settledTime = 0.0f;
 }
 
 // ESC to exit
@@ -43,17 +51,14 @@ void key_callback(GLFWwindow* window, int key, [[maybe_unused]] int scancode,
     // R key to reset camera
     if (key == GLFW_KEY_R && action == GLFW_PRESS) {
         g_camera = createDefaultCamera();
-        g_needsRedraw = true;
     }
 
     // +/- to adjust FOV
     if (key == GLFW_KEY_EQUAL && action != GLFW_RELEASE) {
-        g_camera.fov = std::max(10.0f, g_camera.fov - 5.0f);
-        g_needsRedraw = true;
+        g_camera.targetFov = std::max(10.0f, g_camera.targetFov - 5.0f);
     }
     if (key == GLFW_KEY_MINUS && action != GLFW_RELEASE) {
-        g_camera.fov = std::min(120.0f, g_camera.fov + 5.0f);
-        g_needsRedraw = true;
+        g_camera.targetFov = std::min(120.0f, g_camera.targetFov + 5.0f);
     }
 }
 
@@ -66,9 +71,6 @@ void mouse_button_callback([[maybe_unused]] GLFWwindow* window, int button,
             glfwGetCursorPos(window, &g_camera.lastMouseX, &g_camera.lastMouseY);
         } else if (action == GLFW_RELEASE) {
             g_camera.dragging = false;
-            // Queue a high-res render after drag ends
-            g_highQueuedRender = true;
-            g_needsRedraw = true;
         }
     }
 }
@@ -85,26 +87,22 @@ void cursor_position_callback([[maybe_unused]] GLFWwindow* window,
 
     // Rotate camera: horizontal mouse -> phi, vertical mouse -> theta
     float sensitivity = 0.005f;
-    g_camera.phi -= (float)dx * sensitivity;
-    g_camera.theta += (float)dy * sensitivity;
+    g_camera.targetPhi -= (float)dx * sensitivity;
+    g_camera.targetTheta += (float)dy * sensitivity;
 
     // Clamp theta to avoid poles (singularities at 0 and pi)
-    g_camera.theta = std::max(0.1f, std::min(3.04f, g_camera.theta));
-
-    g_needsRedraw = true;
+    g_camera.targetTheta = std::max(0.1f, std::min(3.04f, g_camera.targetTheta));
 }
 
 // Scroll — zoom (change camera distance)
 void scroll_callback([[maybe_unused]] GLFWwindow* window,
                      [[maybe_unused]] double xoffset, double yoffset) {
     float zoomFactor = powf(0.9f, (float)yoffset);
-    g_camera.distance *= zoomFactor;
+    g_camera.targetDistance *= zoomFactor;
 
     // Clamp distance: don't go inside photon sphere or too far out
     float r_horizon = BH_MASS + sqrtf(BH_MASS * BH_MASS - BH_SPIN * BH_SPIN);
-    g_camera.distance = std::max(r_horizon + 1.5f, std::min(200.0f, g_camera.distance));
-
-    g_needsRedraw = true;
+    g_camera.targetDistance = std::max(r_horizon + 1.5f, std::min(200.0f, g_camera.targetDistance));
 }
 
 // ============================================================================
@@ -188,8 +186,8 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv) {
     glfwSetCursorPosCallback(window, cursor_position_callback);
     glfwSetScrollCallback(window, scroll_callback);
 
-    // Disable VSync for maximum performance during rendering
-    glfwSwapInterval(0);
+    // Enable VSync — caps at monitor refresh rate, prevents wasted GPU cycles
+    glfwSwapInterval(1);
 
     // ====================================================================
     // Initialize GPU Ray Tracer
@@ -219,24 +217,51 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv) {
     int frameCount = 0;
     double fpsUpdateTime = 0.0;
 
+    // Track camera movement for resolution scaling
+    float prevCamDist = g_camera.distance;
+    float prevCamTheta = g_camera.theta;
+    float prevCamPhi = g_camera.phi;
+
     // ====================================================================
-    // Main Loop
+    // Main Loop — continuous rendering (disk always rotating)
     // ====================================================================
 
     while (!glfwWindowShouldClose(window)) {
-        // FPS tracking
+        // Frame timing
         double currentTime = glfwGetTime();
+        float dt = (float)(currentTime - lastTime);
+        dt = std::min(dt, 0.1f);  // Clamp to avoid spiral after long frames
         frameCount++;
-        fpsUpdateTime += currentTime - lastTime;
+        fpsUpdateTime += dt;
         lastTime = currentTime;
 
+        // Accumulate simulation time — disk rotates regardless of input
+        g_simTime += dt * g_simSpeed;
+
+        // Smooth camera interpolation — lerp actual values toward targets
+        g_camera.distance += CAM_SMOOTH * (g_camera.targetDistance - g_camera.distance);
+        g_camera.theta    += CAM_SMOOTH * (g_camera.targetTheta - g_camera.theta);
+        g_camera.phi      += CAM_SMOOTH * (g_camera.targetPhi - g_camera.phi);
+        g_camera.fov      += CAM_SMOOTH * (g_camera.targetFov - g_camera.fov);
+
+        // Detect if camera is still settling (moved since last frame)
+        float camDelta = fabsf(g_camera.distance - prevCamDist)
+                       + fabsf(g_camera.theta - prevCamTheta)
+                       + fabsf(g_camera.phi - prevCamPhi);
+        bool cameraMoving = g_camera.dragging || camDelta > 1e-4f;
+        prevCamDist = g_camera.distance;
+        prevCamTheta = g_camera.theta;
+        prevCamPhi = g_camera.phi;
+
+        // FPS display
         if (fpsUpdateTime >= 1.0) {
             char title[256];
             const char* mode = g_tracer.isAvailable() ? "GPU" : "CPU";
             snprintf(title, sizeof(title),
-                     "Kerr Black Hole [%s: %.1f FPS | Render: %.0f ms | r=%.1fM θ=%.1f° a=%.3f]",
+                     "Kerr Black Hole [%s: %.1f FPS | Trace: %.0fms Shade: %.1fms | r=%.1fM θ=%.1f° a=%.3f]",
                      mode, frameCount / fpsUpdateTime,
-                     g_tracer.isAvailable() ? g_tracer.getLastFrameTimeMs() : 0.0,
+                     g_tracer.isAvailable() ? g_tracer.getLastTraceTimeMs() : 0.0,
+                     g_tracer.isAvailable() ? g_tracer.getLastShadeTimeMs() : 0.0,
                      g_camera.distance,
                      g_camera.theta * 180.0f / 3.14159265f,
                      BH_SPIN);
@@ -245,40 +270,113 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv) {
             fpsUpdateTime = 0.0;
         }
 
-        // Only re-render when camera changes
-        if (g_needsRedraw) {
-            // Use lower resolution during drag for interactivity
-            float scale = g_camera.dragging ? 0.25f : (g_highQueuedRender ? 1.0f : 0.5f);
-            int rw = (int)(g_renderWidth * scale);
-            int rh = (int)(g_renderHeight * scale);
-            rw = std::max(rw, 64);
-            rh = std::max(rh, 36);
+        // ================================================================
+        // Trace/Shade split architecture:
+        //   Camera moves → re-trace geodesics (expensive, ~50-200ms)
+        //   Camera still → shade only from cached g-buffer (cheap, ~1-3ms)
+        //   Disk animation runs in shade pass at full framerate
+        // ================================================================
 
-            if (g_tracer.isAvailable()) {
-                g_tracer.renderFrame(g_camera, rw, rh);
-                g_pixels = g_tracer.getPixels();
+        // Skip frame if window is minimized or invalid
+        if (g_renderWidth <= 0 || g_renderHeight <= 0) {
+            glfwSwapBuffers(window);
+            glfwPollEvents();
+            continue;
+        }
+
+        // Determine render resolution
+        float scale;
+        bool doBloom = false;
+        bool needTrace = false;
+
+        if (g_camera.dragging) {
+            scale = 0.5f;
+            g_settledTime = 0.0f;
+            g_hqRendered = false;
+            needTrace = true;
+        } else if (cameraMoving) {
+            scale = 0.5f;
+            g_settledTime = 0.0f;
+            g_hqRendered = false;
+            needTrace = true;
+        } else if (!g_hqRendered) {
+            g_settledTime += dt;
+            if (g_settledTime > 0.3f) {
+                scale = 1.0f;
+                doBloom = true;
+                needTrace = true;
+                g_hqRendered = true;
             } else {
-                renderFrameCPU(g_camera, rw, rh, g_pixels);
+                scale = 0.7f;
+                needTrace = !g_tracer.hasGeometry();
             }
+        } else {
+            scale = 1.0f;
+            needTrace = false;
+        }
 
-            // Apply simple tone mapping (clamp HDR to [0,1])
-            for (size_t i = 0; i < g_pixels.size(); i += 4) {
-                // Reinhard tone mapping
-                g_pixels[i + 0] = g_pixels[i + 0] / (1.0f + g_pixels[i + 0]);
-                g_pixels[i + 1] = g_pixels[i + 1] / (1.0f + g_pixels[i + 1]);
-                g_pixels[i + 2] = g_pixels[i + 2] / (1.0f + g_pixels[i + 2]);
+        int rw = (int)(g_renderWidth * scale);
+        int rh = (int)(g_renderHeight * scale);
+        rw = std::max(rw, 128);
+        rh = std::max(rh, 72);
+
+        // GPU path: always force trace if g-buffer is stale or missing
+        std::vector<float>* pixelPtr = nullptr;
+        bool gotPixels = false;
+
+        if (g_tracer.isAvailable()) {
+            if (!g_tracer.hasGeometry()) needTrace = true;
+            if (needTrace) {
+                g_tracer.traceGeometry(g_camera, rw, rh);
             }
-
-            uploadPixelsToTexture(g_pixels, rw, rh);
-            g_needsRedraw = g_camera.dragging;  // Keep rendering during drag
-            g_highQueuedRender = false;
-
-            // After first non-drag render at low res, queue a full-res render
-            if (!g_camera.dragging && scale < 1.0f) {
-                g_highQueuedRender = true;
-                g_needsRedraw = true;
+            if (g_tracer.hasGeometry()) {
+                g_tracer.shadeFrame(rw, rh, g_simTime);
+                std::vector<float>& tpix = g_tracer.getPixels();
+                if (!tpix.empty() && (int)tpix.size() == rw * rh * 4) {
+                    pixelPtr = &tpix;
+                    gotPixels = true;
+                }
+            }
+        } else {
+            renderFrameCPU(g_camera, rw, rh, g_pixels, g_simTime);
+            if (!g_pixels.empty()) {
+                pixelPtr = &g_pixels;
+                gotPixels = true;
             }
         }
+
+        // If no valid pixel data, just display whatever is already in the texture
+        if (!gotPixels) {
+            glClear(GL_COLOR_BUFFER_BIT);
+            drawFullscreenQuad();
+            glfwSwapBuffers(window);
+            glfwPollEvents();
+            continue;
+        }
+
+        std::vector<float>& pixels = *pixelPtr;
+
+        // Post-processing
+        if (doBloom) {
+            for (size_t i = 0; i < pixels.size(); i += 4) {
+                pixels[i + 0] = pixels[i + 0] / (1.0f + pixels[i + 0]);
+                pixels[i + 1] = pixels[i + 1] / (1.0f + pixels[i + 1]);
+                pixels[i + 2] = pixels[i + 2] / (1.0f + pixels[i + 2]);
+            }
+            applyBloom(pixels, rw, rh);
+            applyGammaCorrection(pixels);
+        } else {
+            for (size_t i = 0; i < pixels.size(); i += 4) {
+                float r = pixels[i + 0] / (1.0f + pixels[i + 0]);
+                float g = pixels[i + 1] / (1.0f + pixels[i + 1]);
+                float b = pixels[i + 2] / (1.0f + pixels[i + 2]);
+                pixels[i + 0] = (r < 0.0031308f) ? (12.92f * r) : (1.055f * powf(r, 1.0f/2.4f) - 0.055f);
+                pixels[i + 1] = (g < 0.0031308f) ? (12.92f * g) : (1.055f * powf(g, 1.0f/2.4f) - 0.055f);
+                pixels[i + 2] = (b < 0.0031308f) ? (12.92f * b) : (1.055f * powf(b, 1.0f/2.4f) - 0.055f);
+            }
+        }
+
+        uploadPixelsToTexture(pixels, rw, rh);
 
         // Display the ray-traced image
         glClear(GL_COLOR_BUFFER_BIT);

@@ -1,5 +1,5 @@
 # Kerr Black Hole Gravitational Lensing Simulation
-### v1.0.0 — GPU Accelerated Ray Tracer
+### v1.1.0 — GPU Accelerated Ray Tracer
 
 A real-time **gravitational lensing ray tracer** for a spinning (Kerr) black hole with an accretion disk. Using **OpenGL/GLFW** for display and **OpenCL** for GPU-accelerated geodesic integration, the simulation traces photon paths through curved spacetime to produce the characteristic light-bending visual seen in *Interstellar*. The camera supports full orbital controls with progressive rendering — low resolution during interaction, full resolution on release.
 
@@ -7,6 +7,22 @@ A real-time **gravitational lensing ray tracer** for a spinning (Kerr) black hol
 ![GPU](https://img.shields.io/badge/Acceleration-OpenCL-green)
 ![Platform](https://img.shields.io/badge/Platform-Linux-lightgrey)
 ![License](https://img.shields.io/badge/License-MIT-yellow)
+
+---
+
+---
+
+## What's New in v1.1
+
+This release makes the simulation feel alive. No physics changes — purely visual and perceptual improvements.
+
+| Feature | Description |
+|---------|-------------|
+| Rotating accretion disk | Disk material orbits at Keplerian velocity with differential rotation — inner edge spins faster than outer |
+| Continuous rendering | The image updates every frame, not just on camera input |
+| Bloom / glow | Bright regions of the disk bleed light outward, simulating overexposure |
+| sRGB gamma correction | Proper monitor-space output — darker regions gain depth, brighter regions pop |
+| Smooth camera | Camera interpolates smoothly to target position instead of snapping |
 
 ---
 

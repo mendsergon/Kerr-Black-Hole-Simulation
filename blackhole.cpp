@@ -18,13 +18,17 @@ GPURayTracer g_tracer;
 
 GPURayTracer::GPURayTracer()
     : m_initialized(false)
-    , m_lastFrameTimeMs(0.0)
+    , m_gbufValid(false)
+    , m_lastTraceTimeMs(0.0)
+    , m_lastShadeTimeMs(0.0)
     , m_platform(nullptr)
     , m_device(nullptr)
     , m_context(nullptr)
     , m_queue(nullptr)
     , m_program(nullptr)
-    , m_raytraceKernel(nullptr)
+    , m_traceKernel(nullptr)
+    , m_shadeKernel(nullptr)
+    , m_gbufBuffer(nullptr)
     , m_pixelBuffer(nullptr)
     , m_bufferWidth(0)
     , m_bufferHeight(0)
@@ -60,18 +64,23 @@ bool GPURayTracer::initialize() {
 }
 
 void GPURayTracer::cleanup() {
-    if (m_raytraceKernel) clReleaseKernel(m_raytraceKernel);
+    if (m_traceKernel) clReleaseKernel(m_traceKernel);
+    if (m_shadeKernel) clReleaseKernel(m_shadeKernel);
+    if (m_gbufBuffer) clReleaseMemObject(m_gbufBuffer);
     if (m_pixelBuffer) clReleaseMemObject(m_pixelBuffer);
     if (m_program) clReleaseProgram(m_program);
     if (m_queue) clReleaseCommandQueue(m_queue);
     if (m_context) clReleaseContext(m_context);
 
-    m_raytraceKernel = nullptr;
+    m_traceKernel = nullptr;
+    m_shadeKernel = nullptr;
+    m_gbufBuffer = nullptr;
     m_pixelBuffer = nullptr;
     m_program = nullptr;
     m_queue = nullptr;
     m_context = nullptr;
     m_initialized = false;
+    m_gbufValid = false;
 }
 
 bool GPURayTracer::selectBestDevice() {
@@ -218,9 +227,15 @@ bool GPURayTracer::buildProgram() {
         return false;
     }
 
-    m_raytraceKernel = clCreateKernel(m_program, "raytrace", &err);
+    m_traceKernel = clCreateKernel(m_program, "raytrace", &err);
     if (err != CL_SUCCESS) {
         std::cerr << "Failed to create raytrace kernel: " << err << std::endl;
+        return false;
+    }
+
+    m_shadeKernel = clCreateKernel(m_program, "shade", &err);
+    if (err != CL_SUCCESS) {
+        std::cerr << "Failed to create shade kernel: " << err << std::endl;
         return false;
     }
 
@@ -233,62 +248,99 @@ bool GPURayTracer::createBuffers(int width, int height) {
     }
 
     if (m_pixelBuffer) clReleaseMemObject(m_pixelBuffer);
+    if (m_gbufBuffer) clReleaseMemObject(m_gbufBuffer);
 
     cl_int err;
-    size_t bufferSize = width * height * sizeof(cl_float4);
 
-    m_pixelBuffer = clCreateBuffer(m_context, CL_MEM_WRITE_ONLY, bufferSize, nullptr, &err);
+    // G-buffer: 4 float4s per pixel (geometry data)
+    size_t gbufSize = width * height * 4 * sizeof(cl_float4);
+    m_gbufBuffer = clCreateBuffer(m_context, CL_MEM_READ_WRITE, gbufSize, nullptr, &err);
+    if (err != CL_SUCCESS) return false;
+
+    // Pixel buffer: 1 float4 per pixel (RGBA output)
+    size_t pixelSize = width * height * sizeof(cl_float4);
+    m_pixelBuffer = clCreateBuffer(m_context, CL_MEM_WRITE_ONLY, pixelSize, nullptr, &err);
     if (err != CL_SUCCESS) return false;
 
     m_bufferWidth = width;
     m_bufferHeight = height;
+    m_gbufValid = false;  // New size invalidates cached geometry
     return true;
 }
 
-void GPURayTracer::renderFrame(const Camera& camera, int width, int height) {
+void GPURayTracer::traceGeometry(const Camera& camera, int width, int height) {
     if (!m_initialized) return;
-
-    if (!createBuffers(width, height)) {
-        std::cerr << "Failed to create GPU buffers." << std::endl;
-        return;
-    }
+    if (!createBuffers(width, height)) return;
 
     auto startTime = std::chrono::high_resolution_clock::now();
 
-    // Convert camera spherical to kernel parameters
     float cam_fov_rad = camera.fov * 3.14159265f / 180.0f;
 
-    // Set kernel arguments
-    clSetKernelArg(m_raytraceKernel, 0, sizeof(cl_mem), &m_pixelBuffer);
-    clSetKernelArg(m_raytraceKernel, 1, sizeof(int), &width);
-    clSetKernelArg(m_raytraceKernel, 2, sizeof(int), &height);
-    clSetKernelArg(m_raytraceKernel, 3, sizeof(float), &camera.distance);
-    clSetKernelArg(m_raytraceKernel, 4, sizeof(float), &camera.theta);
-    clSetKernelArg(m_raytraceKernel, 5, sizeof(float), &camera.phi);
-    clSetKernelArg(m_raytraceKernel, 6, sizeof(float), &cam_fov_rad);
+    // Set trace kernel arguments — writes g-buffer
+    clSetKernelArg(m_traceKernel, 0, sizeof(cl_mem), &m_gbufBuffer);
+    clSetKernelArg(m_traceKernel, 1, sizeof(int), &width);
+    clSetKernelArg(m_traceKernel, 2, sizeof(int), &height);
+    clSetKernelArg(m_traceKernel, 3, sizeof(float), &camera.distance);
+    clSetKernelArg(m_traceKernel, 4, sizeof(float), &camera.theta);
+    clSetKernelArg(m_traceKernel, 5, sizeof(float), &camera.phi);
+    clSetKernelArg(m_traceKernel, 6, sizeof(float), &cam_fov_rad);
 
-    // Launch kernel — one work item per pixel
     size_t totalPixels = width * height;
     size_t localSize = 256;
     size_t globalSize = ((totalPixels + localSize - 1) / localSize) * localSize;
 
-    cl_int err = clEnqueueNDRangeKernel(m_queue, m_raytraceKernel, 1, nullptr,
+    cl_int err = clEnqueueNDRangeKernel(m_queue, m_traceKernel, 1, nullptr,
                                          &globalSize, &localSize, 0, nullptr, nullptr);
     if (err != CL_SUCCESS) {
         std::cerr << "Failed to launch raytrace kernel: " << err << std::endl;
         return;
     }
-
     clFinish(m_queue);
 
-    // Read back pixels
+    m_gbufValid = true;
+
+    auto endTime = std::chrono::high_resolution_clock::now();
+    m_lastTraceTimeMs = std::chrono::duration<double, std::milli>(endTime - startTime).count();
+}
+
+void GPURayTracer::shadeFrame(int width, int height, float simTime) {
+    if (!m_initialized || !m_gbufValid) return;
+
+    // If resolution changed since trace, g-buffer is stale — need re-trace
+    if (width != m_bufferWidth || height != m_bufferHeight) {
+        m_gbufValid = false;
+        return;
+    }
+
+    auto startTime = std::chrono::high_resolution_clock::now();
+
+    // Set shade kernel arguments — reads g-buffer, writes pixels
+    clSetKernelArg(m_shadeKernel, 0, sizeof(cl_mem), &m_gbufBuffer);
+    clSetKernelArg(m_shadeKernel, 1, sizeof(cl_mem), &m_pixelBuffer);
+    clSetKernelArg(m_shadeKernel, 2, sizeof(int), &width);
+    clSetKernelArg(m_shadeKernel, 3, sizeof(int), &height);
+    clSetKernelArg(m_shadeKernel, 4, sizeof(float), &simTime);
+
+    size_t totalPixels = width * height;
+    size_t localSize = 256;
+    size_t globalSize = ((totalPixels + localSize - 1) / localSize) * localSize;
+
+    cl_int err = clEnqueueNDRangeKernel(m_queue, m_shadeKernel, 1, nullptr,
+                                         &globalSize, &localSize, 0, nullptr, nullptr);
+    if (err != CL_SUCCESS) {
+        std::cerr << "Failed to launch shade kernel: " << err << std::endl;
+        return;
+    }
+    clFinish(m_queue);
+
+    // Read pixels back
     m_pixels.resize(width * height * 4);
     clEnqueueReadBuffer(m_queue, m_pixelBuffer, CL_TRUE, 0,
                         width * height * sizeof(cl_float4), m_pixels.data(),
                         0, nullptr, nullptr);
 
     auto endTime = std::chrono::high_resolution_clock::now();
-    m_lastFrameTimeMs = std::chrono::duration<double, std::milli>(endTime - startTime).count();
+    m_lastShadeTimeMs = std::chrono::duration<double, std::milli>(endTime - startTime).count();
 }
 
 // ============================================================================
@@ -439,33 +491,55 @@ float hash(float x, float y) {
 glm::vec3 starfield_color(float theta, float phi) {
     float u = phi / (2.0f * PI);
     float v = theta / PI;
-    float gx = u * 200.0f;
-    float gy = v * 100.0f;
-    float cx = floorf(gx);
-    float cy = floorf(gy);
-    float fx = gx - cx;
-    float fy = gy - cy;
 
-    float star_chance = hash(cx, cy);
-    glm::vec3 color(0.005f, 0.005f, 0.015f);
+    glm::vec3 color(0.003f, 0.003f, 0.005f);
 
-    if (star_chance > 0.97f) {
-        float sx = hash(cx + 1.0f, cy);
-        float sy = hash(cx, cy + 1.0f);
-        float dx = fx - sx;
-        float dy = fy - sy;
-        float dist = sqrtf(dx * dx + dy * dy);
-        float brightness = expf(-dist * dist * 50.0f) * (0.5f + 0.5f * hash(cx + 3.0f, cy + 7.0f));
-        float temp = hash(cx + 5.0f, cy + 3.0f);
-        glm::vec3 star_col(0.8f + 0.2f * temp, 0.85f + 0.15f * temp, 1.0f - 0.3f * temp);
-        color += star_col * brightness;
+    // Layer 1: dense dim stars — check 3x3 neighborhood
+    float gx1 = u * 400.0f, gy1 = v * 200.0f;
+    float cx1 = floorf(gx1), cy1 = floorf(gy1);
+    float fx1 = gx1 - cx1, fy1 = gy1 - cy1;
+
+    for (int dy = -1; dy <= 1; dy++) {
+        for (int dx = -1; dx <= 1; dx++) {
+            float ncx = cx1 + dx, ncy = cy1 + dy;
+            if (hash(ncx, ncy) > 0.94f) {
+                float sx = hash(ncx + 1.0f, ncy);
+                float sy = hash(ncx, ncy + 1.0f);
+                float ddx = fx1 - sx - dx, ddy = fy1 - sy - dy;
+                float dist = sqrtf(ddx*ddx + ddy*ddy);
+                float br = expf(-dist*dist*80.0f) * 0.3f * (0.3f + 0.7f * hash(ncx+3.0f, ncy+7.0f));
+                float t = hash(ncx+5.0f, ncy+3.0f);
+                color += glm::vec3(0.7f+0.3f*t, 0.75f+0.25f*t, 0.9f-0.2f*t) * br;
+            }
+        }
     }
+
+    // Layer 2: sparse bright stars — check 3x3 neighborhood
+    float gx2 = u * 120.0f, gy2 = v * 60.0f;
+    float cx2 = floorf(gx2), cy2 = floorf(gy2);
+    float fx2 = gx2 - cx2, fy2 = gy2 - cy2;
+
+    for (int dy = -1; dy <= 1; dy++) {
+        for (int dx = -1; dx <= 1; dx++) {
+            float ncx = cx2 + dx, ncy = cy2 + dy;
+            if (hash(ncx+77.0f, ncy+33.0f) > 0.96f) {
+                float sx = hash(ncx+11.0f, ncy);
+                float sy = hash(ncx, ncy+11.0f);
+                float ddx = fx2 - sx - dx, ddy = fy2 - sy - dy;
+                float dist = sqrtf(ddx*ddx + ddy*ddy);
+                float br = expf(-dist*dist*40.0f) * (0.5f + 0.5f * hash(ncx+13.0f, ncy+17.0f));
+                float t = hash(ncx+15.0f, ncy+13.0f);
+                color += glm::vec3(0.9f+0.1f*t, 0.85f+0.15f*t, 1.0f-0.3f*t) * br;
+            }
+        }
+    }
+
     return color;
 }
 
 } // namespace cpu
 
-void renderFrameCPU(const Camera& camera, int width, int height, std::vector<float>& pixels) {
+void renderFrameCPU(const Camera& camera, int width, int height, std::vector<float>& pixels, float simTime) {
     pixels.resize(width * height * 4);
     float cam_fov_rad = camera.fov * cpu::PI / 180.0f;
     float aspect = (float)width / (float)height;
@@ -523,9 +597,12 @@ void renderFrameCPU(const Camera& camera, int width, int height, std::vector<flo
                 if (cross_r >= DISK_INNER && cross_r <= DISK_OUTER) {
                     float T_norm = powf(DISK_INNER / cross_r, 0.75f);
                     float a = BH_SPIN;
+                    // Animate: offset phi by Keplerian angular velocity × time
+                    float omega_k = 1.0f / (sqrtf(cross_r) + a);
+                    float disk_phi = cross_phi - omega_k * simTime;
                     float v_orb = 1.0f / (sqrtf(cross_r) + a);
                     float gamma = 1.0f / sqrtf(1.0f - v_orb * v_orb);
-                    float doppler = 1.0f / (gamma * (1.0f + v_orb * sinf(cross_phi)));
+                    float doppler = 1.0f / (gamma * (1.0f + v_orb * sinf(disk_phi)));
                     float T_boosted = std::clamp(T_norm * doppler, 0.0f, 1.0f);
                     float intensity = std::clamp(doppler * doppler * doppler * doppler * 1.5f, 0.0f, 5.0f);
                     glm::vec3 base = cpu::temperature_to_color(T_boosted);
@@ -555,10 +632,15 @@ void renderFrameCPU(const Camera& camera, int width, int height, std::vector<flo
             }
         }
 
-        pixels[idx * 4 + 0] = hit_disk ? disk_col.r : 0.02f;
-        pixels[idx * 4 + 1] = hit_disk ? disk_col.g : 0.01f;
-        pixels[idx * 4 + 2] = hit_disk ? disk_col.b : 0.03f;
-        pixels[idx * 4 + 3] = 1.0f;
+        // Max steps — treat as escaped at current angle (not black)
+        {
+            float exit_phi = fmodf(state.phi + 100.0f * cpu::PI, 2.0f * cpu::PI);
+            glm::vec3 bg = cpu::starfield_color(state.theta, exit_phi);
+            pixels[idx * 4 + 0] = disk_col.r + (1.0f - disk_alpha) * bg.r;
+            pixels[idx * 4 + 1] = disk_col.g + (1.0f - disk_alpha) * bg.g;
+            pixels[idx * 4 + 2] = disk_col.b + (1.0f - disk_alpha) * bg.b;
+            pixels[idx * 4 + 3] = 1.0f;
+        }
 
         next_pixel:;
     }
@@ -574,8 +656,114 @@ Camera createDefaultCamera() {
     cam.theta = 1.3f;                      // Slightly above equatorial plane (~74°)
     cam.phi = 0.0f;                        // Initial azimuthal angle
     cam.fov = 60.0f;                       // 60 degree field of view
+    cam.targetDistance = cam.distance;
+    cam.targetTheta = cam.theta;
+    cam.targetPhi = cam.phi;
+    cam.targetFov = cam.fov;
     cam.lastMouseX = 0.0;
     cam.lastMouseY = 0.0;
     cam.dragging = false;
     return cam;
+}
+
+// ============================================================================
+// Post-Processing: Bloom
+// ============================================================================
+
+void applyBloom(std::vector<float>& pixels, int width, int height) {
+    // Extract bright pixels into separate buffer
+    int size = width * height * 4;
+    std::vector<float> bright(size, 0.0f);
+    float threshold = 0.75f;
+
+    for (int i = 0; i < size; i += 4) {
+        float luminance = 0.2126f * pixels[i] + 0.7152f * pixels[i+1] + 0.0722f * pixels[i+2];
+        if (luminance > threshold) {
+            float factor = (luminance - threshold) / (1.0f - threshold);
+            bright[i + 0] = pixels[i + 0] * factor;
+            bright[i + 1] = pixels[i + 1] * factor;
+            bright[i + 2] = pixels[i + 2] * factor;
+        }
+    }
+
+    // Gaussian blur radius scales with resolution
+    int radius = std::max(2, width / 80);
+    float sigma = (float)radius / 2.0f;
+
+    // Precompute 1D Gaussian weights
+    std::vector<float> weights(radius + 1);
+    float weightSum = 0.0f;
+    for (int i = 0; i <= radius; i++) {
+        weights[i] = expf(-(float)(i * i) / (2.0f * sigma * sigma));
+        weightSum += (i == 0) ? weights[i] : 2.0f * weights[i];
+    }
+    for (int i = 0; i <= radius; i++) {
+        weights[i] /= weightSum;
+    }
+
+    // Horizontal blur pass
+    std::vector<float> temp(size, 0.0f);
+    for (int y = 0; y < height; y++) {
+        for (int x = 0; x < width; x++) {
+            float r = 0, g = 0, b = 0;
+            for (int k = -radius; k <= radius; k++) {
+                int sx = std::max(0, std::min(width - 1, x + k));
+                int idx = (y * width + sx) * 4;
+                float w = weights[abs(k)];
+                r += bright[idx + 0] * w;
+                g += bright[idx + 1] * w;
+                b += bright[idx + 2] * w;
+            }
+            int idx = (y * width + x) * 4;
+            temp[idx + 0] = r;
+            temp[idx + 1] = g;
+            temp[idx + 2] = b;
+        }
+    }
+
+    // Vertical blur pass
+    std::vector<float> blurred(size, 0.0f);
+    for (int y = 0; y < height; y++) {
+        for (int x = 0; x < width; x++) {
+            float r = 0, g = 0, b = 0;
+            for (int k = -radius; k <= radius; k++) {
+                int sy = std::max(0, std::min(height - 1, y + k));
+                int idx = (sy * width + x) * 4;
+                float w = weights[abs(k)];
+                r += temp[idx + 0] * w;
+                g += temp[idx + 1] * w;
+                b += temp[idx + 2] * w;
+            }
+            int idx = (y * width + x) * 4;
+            blurred[idx + 0] = r;
+            blurred[idx + 1] = g;
+            blurred[idx + 2] = b;
+        }
+    }
+
+    // Composite bloom back onto original
+    float bloomStrength = 0.4f;
+    for (int i = 0; i < size; i += 4) {
+        pixels[i + 0] = std::min(1.0f, pixels[i + 0] + blurred[i + 0] * bloomStrength);
+        pixels[i + 1] = std::min(1.0f, pixels[i + 1] + blurred[i + 1] * bloomStrength);
+        pixels[i + 2] = std::min(1.0f, pixels[i + 2] + blurred[i + 2] * bloomStrength);
+    }
+}
+
+// ============================================================================
+// Post-Processing: sRGB Gamma Correction
+// ============================================================================
+
+static inline float linearToSRGB(float x) {
+    if (x <= 0.0f) return 0.0f;
+    if (x >= 1.0f) return 1.0f;
+    return (x < 0.0031308f) ? (12.92f * x) : (1.055f * powf(x, 1.0f / 2.4f) - 0.055f);
+}
+
+void applyGammaCorrection(std::vector<float>& pixels) {
+    for (size_t i = 0; i < pixels.size(); i += 4) {
+        pixels[i + 0] = linearToSRGB(pixels[i + 0]);
+        pixels[i + 1] = linearToSRGB(pixels[i + 1]);
+        pixels[i + 2] = linearToSRGB(pixels[i + 2]);
+    }
 }
