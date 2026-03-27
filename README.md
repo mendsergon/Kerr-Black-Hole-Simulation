@@ -442,10 +442,10 @@ The trace kernel (geodesic integration) is the expensive operation — up to 200
 
 | File | Lines | Description |
 |------|-------|-------------|
-| `main.cpp` | ~450 | GLFW window, OpenGL, camera controls, trace/shade render loop, post-processing |
-| `blackhole.h` | ~165 | SimConfig, Camera, GPURayTracer class, function declarations |
-| `blackhole.cpp` | ~1030 | GPU init, kernel management, CPU fallback, bloom, gamma LUT, HUD, screenshots, CLI parser |
-| `blackhole.cl` | ~490 | Two OpenCL kernels: `raytrace` (geodesic integration → g-buffer) and `shade` (g-buffer → pixels) |
+| `main.cpp` | 452 | GLFW window, OpenGL, camera controls, trace/shade render loop, post-processing |
+| `blackhole.h` | 167 | SimConfig, Camera, GPURayTracer class, function declarations |
+| `blackhole.cpp` | 1048 | GPU init, kernel management, CPU fallback, bloom, gamma LUT, HUD, screenshots, CLI parser |
+| `blackhole.cl` | 493 | Two OpenCL kernels: `raytrace` (geodesic integration → g-buffer) and `shade` (g-buffer → pixels) |
 | `Makefile` | 62 | Cross-platform build with auto dependency detection |
 
 ---
