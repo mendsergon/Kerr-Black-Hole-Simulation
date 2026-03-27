@@ -1,7 +1,7 @@
 # Kerr Black Hole Gravitational Lensing Simulation
-### v1.1.0 — GPU Accelerated Ray Tracer
+### v1.2.0 — GPU Accelerated Ray Tracer
 
-A real-time **gravitational lensing ray tracer** for a spinning (Kerr) black hole with an accretion disk. Using **OpenGL/GLFW** for display and **OpenCL** for GPU-accelerated geodesic integration, the simulation traces photon paths through curved spacetime to produce the characteristic light-bending visual seen in *Interstellar*. The camera supports full orbital controls with progressive rendering — low resolution during interaction, full resolution on release.
+A real-time **gravitational lensing ray tracer** for a spinning (Kerr) black hole with an accretion disk. Uses a **trace/shade split architecture** — geodesics traced once via **OpenCL** GPU compute, then re-shaded every frame for smooth disk animation. **OpenGL/GLFW** display with interactive orbital camera, bloom post-processing, and configurable parameters via command line.
 
 ![Bodies](https://img.shields.io/badge/Physics-Kerr_Metric-blue)
 ![GPU](https://img.shields.io/badge/Acceleration-OpenCL-green)
@@ -9,6 +9,21 @@ A real-time **gravitational lensing ray tracer** for a spinning (Kerr) black hol
 ![License](https://img.shields.io/badge/License-MIT-yellow)
 
 ---
+
+## What's New in v1.2
+
+Configurable simulation, on-screen diagnostics, screenshot capture, and performance optimization.
+
+| Feature | Description |
+|---------|-------------|
+| Command-line parameters | `--spin`, `--disk-inner`, `--disk-outer`, `--steps`, `--width`, `--height`, `--distance`, `--theta`, `--fov`, `--help` |
+| On-screen HUD | Press H to toggle — shows spin, camera position, FPS, trace/shade times, disk and step config |
+| Screenshot capture | Press F12 — saves timestamped PPM to `Screenshots/` directory (auto-created) |
+| Dynamic kernel config | Spin, disk radii, and max steps injected into the GPU kernel at build time via OpenCL defines |
+| GPU tone mapping | Reinhard + sRGB gamma moved into the shade kernel — eliminates CPU per-pixel post-processing on the fast path |
+| Bloom parallelized | Gaussian blur passes use OpenMP for multi-threaded CPU execution |
+| sRGB gamma LUT | Precomputed 4096-entry lookup table replaces per-pixel `powf` calls |
+| Texture upload | `glTexSubImage2D` reuses allocated texture instead of reallocating every frame |
 
 ---
 
@@ -38,7 +53,7 @@ The visual features emerge directly from the physics:
 - **Doppler beaming** — one side of the disk appears brighter than the other because material orbiting toward the camera is blueshifted (brighter) and material receding is redshifted (dimmer)
 - **Shadow (silhouette)** — the dark region where all photons fall into the event horizon
 
-The spin parameter is set to **a = 0.998M** — matching the near-extremal Kerr black hole used in the *Interstellar* visual effects (Gargantua used a ≈ 0.9999).
+The spin parameter defaults to **a = 0.998M** (configurable via `--spin`) — matching the near-extremal Kerr black hole used in the *Interstellar* visual effects (Gargantua used a ≈ 0.9999).
 
 ---
 
@@ -47,8 +62,8 @@ The spin parameter is set to **a = 0.998M** — matching the near-extremal Kerr 
 ### Clone the Repository
 
 ```bash
-git clone <repository-url>
-cd kerr-blackhole-simulation
+git clone git@github.com:mendsergon/Kerr-Black-Hole-Simulation.git
+cd Kerr-Black-Hole-Simulation
 ```
 
 ### Install Dependencies
@@ -95,7 +110,11 @@ make debug
 ### Run
 
 ```bash
-./blackhole
+./blackhole                          # Default: a=0.998, 1280x720
+./blackhole --spin 0.5               # Lower spin — rounder shadow
+./blackhole --spin 0.999 --steps 3000  # Near-extremal with finer integration
+./blackhole --width 1920 --height 1080 # Higher resolution
+./blackhole --help                     # Show all options
 ```
 
 ### Controls
@@ -107,6 +126,8 @@ make debug
 | Scroll Down | Zoom out (increase camera distance) |
 | + / - | Increase / decrease field of view |
 | R | Reset camera to default position |
+| H | Toggle HUD overlay |
+| F12 | Save screenshot to `Screenshots/` |
 | ESC | Exit |
 
 ---
@@ -273,7 +294,7 @@ For each pixel, the algorithm proceeds as:
 4. **At each step, check for:**
    - **Equatorial plane crossing** → accretion disk intersection
    - **r ≤ r_+ + ε** → photon absorbed by event horizon (black pixel)
-   - **r > 50M with p_r > 0** → photon escaped (sample star field)
+   - **r > 50M with p_r < 0** → photon escaped (sample star field)
 5. **Composite disk crossings** using front-to-back alpha blending (disk is semi-transparent, allowing multiple crossings to contribute)
 
 ---
@@ -335,31 +356,36 @@ In the simulation, this is captured naturally: when a ray is traced backward fro
 
 ## Rendering
 
-### Progressive Resolution
+### Trace/Shade Architecture (v1.1+)
 
-To maintain interactivity during camera rotation, the renderer uses three resolution tiers:
+The renderer uses a two-kernel architecture to separate expensive geodesic integration from cheap coloring:
+
+| Kernel | Cost | When | What |
+|--------|------|------|------|
+| `raytrace` | 50–200 ms | Camera moves | Traces geodesics, writes geometry buffer (hit type, disk crossings, exit angles) |
+| `shade` | 1–3 ms | Every frame | Reads g-buffer, computes colors with animated disk rotation, tone mapping, gamma |
+
+When the camera is still, only the shade kernel runs — smooth 60fps animation at full resolution.
+
+### Resolution Tiers
 
 | Mode | Resolution Scale | When |
 |------|-----------------|------|
-| Drag | 25% | While mouse button is held |
-| Preview | 50% | After release, first render |
-| Full | 100% | After preview, final render |
+| Drag | 50% | While mouse button is held (retrace) |
+| Settling | 50% | Camera lerping to rest (retrace) |
+| Waiting | 70% | Camera nearly settled (shade only if g-buffer exists) |
+| HQ snapshot | 100% | After camera settles for 0.3s (retrace + bloom) |
+| Continuous | 100% | After HQ frame (shade only — free) |
 
-The low-resolution frame is upscaled via bilinear filtering on the GPU texture, providing immediate visual feedback during interaction.
+### Post-Processing
 
-### Tone Mapping
-
-The raw ray-traced image is in HDR (high dynamic range) — the Doppler-boosted regions of the disk can exceed an intensity of 5.0. Before display, a **Reinhard tone mapping** operator is applied:
-
-```
-L_display = L_raw / (1 + L_raw)
-```
-
-This compresses the dynamic range to [0, 1] while preserving relative brightness differences.
+- **Reinhard tone mapping** — compresses HDR to [0,1]: `L = L / (1 + L)`. Applied on GPU in the shade kernel (fast path) or on CPU (bloom path).
+- **Bloom glow** — applied once on the HQ snapshot. Extracts pixels above luminance 0.75, two-pass separable Gaussian blur (OpenMP parallelized), composited at 40% strength.
+- **sRGB gamma correction** — proper transfer function for monitor output. GPU-accelerated on the fast path, LUT-accelerated on the CPU path.
 
 ### Star Field
 
-The background star field is procedural, generated from a hash function in the OpenCL kernel. Stars are placed on a grid with random positions and brightnesses, producing a sparse but convincing backdrop that reveals the gravitational lensing distortion.
+Two-layer procedural star field generated from hash functions in the shade kernel. Dense dim stars on a fine 400×200 grid with sparse bright stars on a coarse 120×60 grid. Both layers use 3×3 neighbor cell lookups to prevent star cutoff at cell boundaries. Gravitational lensing distortion is directly visible in the star positions.
 
 ---
 
@@ -384,14 +410,15 @@ If no GPU is detected, the simulation falls back to CPU computation with OpenMP 
 
 ### Performance
 
-| Configuration | Resolution | Render Time | Interactive? |
-|--------------|------------|-------------|-------------|
-| Discrete GPU (RDNA2/RTX) | 1280×720 | 50–200 ms | Yes |
-| Discrete GPU | 320×180 (drag) | 5–15 ms | Smooth |
-| Integrated GPU | 1280×720 | 500–2000 ms | Marginal |
-| CPU (8-core, OpenMP) | 1280×720 | 2–10 sec | No (static only) |
+| Configuration | Resolution | Trace Time | Shade Time | Animation FPS |
+|--------------|------------|------------|------------|---------------|
+| Discrete GPU (RDNA3) | 1280×720 | 50–200 ms | 1–3 ms | 50–60+ |
+| Discrete GPU (RDNA3) | 2560×1440 (60%) | 100–400 ms | 3–8 ms | ~50 |
+| Discrete GPU | 640×360 (drag) | 10–30 ms | <1 ms | Smooth |
+| Integrated GPU | 1280×720 | 500–2000 ms | 10–50 ms | Low |
+| CPU (8-core, OpenMP) | 1280×720 | 2–10 sec | N/A | No animation |
 
-The bottleneck is the per-ray geodesic integration: up to 2000 RK4 steps × 4 Hamiltonian evaluations per step × 6 finite-difference evaluations per Hamiltonian = ~48,000 floating-point operations per pixel. At 1280×720, that's ~44 billion operations per frame.
+The trace kernel (geodesic integration) is the expensive operation — up to 2000 RK4 steps per pixel. The shade kernel (coloring from cached g-buffer) is trivially fast and runs every frame for smooth disk animation.
 
 ---
 
@@ -413,23 +440,23 @@ The bottleneck is the per-ray geodesic integration: up to 2000 RK4 steps × 4 Ha
 
 ## Project Structure
 
-| File | Description |
-|------|-------------|
-| `main.cpp` | GLFW window, OpenGL setup, camera controls, progressive render loop |
-| `blackhole.h` | Camera struct, GPURayTracer class, constants, function declarations |
-| `blackhole.cpp` | GPU initialization, kernel management, CPU fallback ray tracer |
-| `blackhole.cl` | OpenCL kernel — Kerr geodesic integration, disk intersection, compositing |
-| `Makefile` | Cross-platform build with auto dependency detection |
+| File | Lines | Description |
+|------|-------|-------------|
+| `main.cpp` | ~450 | GLFW window, OpenGL, camera controls, trace/shade render loop, post-processing |
+| `blackhole.h` | ~165 | SimConfig, Camera, GPURayTracer class, function declarations |
+| `blackhole.cpp` | ~1030 | GPU init, kernel management, CPU fallback, bloom, gamma LUT, HUD, screenshots, CLI parser |
+| `blackhole.cl` | ~490 | Two OpenCL kernels: `raytrace` (geodesic integration → g-buffer) and `shade` (g-buffer → pixels) |
+| `Makefile` | 62 | Cross-platform build with auto dependency detection |
 
 ---
 
 ## Known Limitations
 
-- **Fixed spin parameter** — a = 0.998 is hardcoded in the kernel. Changing it requires recompiling the OpenCL kernel (or passing it as a kernel argument, which is straightforward to add).
 - **No gravitational redshift** on background stars — escaped photons are rendered at their original color without accounting for the energy change from climbing out of the potential well.
 - **Thin disk only** — a volumetric accretion flow (like a thick torus or ADAF) would produce different visual features but requires full radiative transfer.
 - **No polarization** — real observations (e.g., the EHT image of M87*) show polarization patterns from the magnetic field structure, which this simulation does not model.
 - **Coordinate singularity at poles** — θ = 0 and θ = π are clamped to 0.01 rad to avoid division by zero in the metric components.
+- **GPU→CPU readback bottleneck** — pixel data is read back from GPU to CPU every frame for texture upload. OpenCL-GL interop (planned for v3.0) would eliminate this.
 
 ---
 

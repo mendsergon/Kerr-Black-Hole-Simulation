@@ -11,21 +11,26 @@
 // ============================================================================
 
 Camera g_camera;
-int g_renderWidth = RENDER_WIDTH;
-int g_renderHeight = RENDER_HEIGHT;
+int g_renderWidth = 1280;
+int g_renderHeight = 720;
 std::vector<float> g_pixels;
 GLuint g_texture = 0;
 
 // Simulation time — accumulates every frame for disk rotation
 float g_simTime = 0.0f;
-float g_simSpeed = 15.0f;  // Time units per real second (fast enough to see rotation)
+float g_simSpeed = 15.0f;
 
-// Camera smoothing factor (0 = no smoothing, 1 = frozen)
+// Camera smoothing factor
 const float CAM_SMOOTH = 0.12f;
 
 // High-quality render state
-float g_settledTime = 0.0f;       // How long camera has been still
-bool g_hqRendered = false;         // Whether we've done a high-quality frame since last move
+float g_settledTime = 0.0f;
+bool g_hqRendered = false;
+
+// HUD and screenshot
+bool g_showHUD = false;
+bool g_screenshotRequested = false;
+double g_fps = 0.0;
 
 // ============================================================================
 // Callbacks
@@ -41,24 +46,30 @@ void framebuffer_size_callback([[maybe_unused]] GLFWwindow* window, int width, i
     g_settledTime = 0.0f;
 }
 
-// ESC to exit
+// ESC to exit, R reset, +/- FOV, F12 screenshot, H HUD
 void key_callback(GLFWwindow* window, int key, [[maybe_unused]] int scancode,
                   int action, [[maybe_unused]] int mods) {
     if (key == GLFW_KEY_ESCAPE && action == GLFW_PRESS) {
         glfwSetWindowShouldClose(window, GLFW_TRUE);
     }
 
-    // R key to reset camera
     if (key == GLFW_KEY_R && action == GLFW_PRESS) {
-        g_camera = createDefaultCamera();
+        g_camera = createDefaultCamera(g_config);
     }
 
-    // +/- to adjust FOV
     if (key == GLFW_KEY_EQUAL && action != GLFW_RELEASE) {
         g_camera.targetFov = std::max(10.0f, g_camera.targetFov - 5.0f);
     }
     if (key == GLFW_KEY_MINUS && action != GLFW_RELEASE) {
         g_camera.targetFov = std::min(120.0f, g_camera.targetFov + 5.0f);
+    }
+
+    if (key == GLFW_KEY_F12 && action == GLFW_PRESS) {
+        g_screenshotRequested = true;
+    }
+
+    if (key == GLFW_KEY_H && action == GLFW_PRESS) {
+        g_showHUD = !g_showHUD;
     }
 }
 
@@ -101,7 +112,7 @@ void scroll_callback([[maybe_unused]] GLFWwindow* window,
     g_camera.targetDistance *= zoomFactor;
 
     // Clamp distance: don't go inside photon sphere or too far out
-    float r_horizon = BH_MASS + sqrtf(BH_MASS * BH_MASS - BH_SPIN * BH_SPIN);
+    float r_horizon = BH_MASS + sqrtf(BH_MASS * BH_MASS - g_config.spin * g_config.spin);
     g_camera.targetDistance = std::max(r_horizon + 1.5f, std::min(200.0f, g_camera.targetDistance));
 }
 
@@ -109,19 +120,28 @@ void scroll_callback([[maybe_unused]] GLFWwindow* window,
 // Texture Upload — Displays ray-traced image via fullscreen quad
 // ============================================================================
 
+static int g_texWidth = 0, g_texHeight = 0;
+
 void uploadPixelsToTexture(const std::vector<float>& pixels, int width, int height) {
     if (g_texture == 0) {
         glGenTextures(1, &g_texture);
     }
 
     glBindTexture(GL_TEXTURE_2D, g_texture);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
 
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA32F, width, height, 0,
-                 GL_RGBA, GL_FLOAT, pixels.data());
+    if (width != g_texWidth || height != g_texHeight) {
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA32F, width, height, 0,
+                     GL_RGBA, GL_FLOAT, pixels.data());
+        g_texWidth = width;
+        g_texHeight = height;
+    } else {
+        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, width, height,
+                        GL_RGBA, GL_FLOAT, pixels.data());
+    }
 }
 
 void drawFullscreenQuad() {
@@ -149,16 +169,22 @@ void drawFullscreenQuad() {
 // Main
 // ============================================================================
 
-int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv) {
+int main(int argc, char** argv) {
+    // Parse command line
+    g_config = parseArgs(argc, argv);
+    g_renderWidth = g_config.windowWidth;
+    g_renderHeight = g_config.windowHeight;
+
     std::cout << "============================================" << std::endl;
-    std::cout << "  Kerr Black Hole Simulation v1.0" << std::endl;
+    std::cout << "  Kerr Black Hole Simulation v1.2" << std::endl;
     std::cout << "  Gravitational Lensing Ray Tracer" << std::endl;
     std::cout << "============================================" << std::endl;
     std::cout << std::endl;
     std::cout << "Black hole parameters:" << std::endl;
     std::cout << "  Mass: " << BH_MASS << " (geometrized units)" << std::endl;
-    std::cout << "  Spin: " << BH_SPIN << " (a/M, Interstellar-like)" << std::endl;
-    std::cout << "  Accretion disk: " << DISK_INNER << "M to " << DISK_OUTER << "M" << std::endl;
+    std::cout << "  Spin: " << g_config.spin << " (a/M)" << std::endl;
+    std::cout << "  Accretion disk: " << g_config.diskInner << "M to " << g_config.diskOuter << "M" << std::endl;
+    std::cout << "  Max steps: " << g_config.maxSteps << std::endl;
     std::cout << std::endl;
 
     // Initialize GLFW
@@ -171,7 +197,7 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv) {
     glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
     glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_COMPAT_PROFILE);
 
-    GLFWwindow* window = glfwCreateWindow(RENDER_WIDTH, RENDER_HEIGHT,
+    GLFWwindow* window = glfwCreateWindow(g_config.windowWidth, g_config.windowHeight,
                                            "Kerr Black Hole — GPU Ray Tracer", NULL, NULL);
     if (!window) {
         std::cerr << "Failed to create GLFW window" << std::endl;
@@ -186,28 +212,30 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv) {
     glfwSetCursorPosCallback(window, cursor_position_callback);
     glfwSetScrollCallback(window, scroll_callback);
 
-    // Enable VSync — caps at monitor refresh rate, prevents wasted GPU cycles
-    glfwSwapInterval(1);
+    // Disable VSync — 180Hz monitor, let it run as fast as possible
+    glfwSwapInterval(0);
 
     // ====================================================================
     // Initialize GPU Ray Tracer
     // ====================================================================
 
     std::cout << std::endl;
-    if (!g_tracer.initialize()) {
+    if (!g_tracer.initialize(g_config)) {
         std::cout << "⚠ GPU acceleration unavailable — using CPU fallback" << std::endl;
         std::cout << "  (This will be significantly slower)" << std::endl;
     }
     std::cout << std::endl;
 
-    // Create camera
-    g_camera = createDefaultCamera();
+    // Create camera from config
+    g_camera = createDefaultCamera(g_config);
 
     std::cout << "Controls:" << std::endl;
     std::cout << "  Left-click + Drag — Orbit camera" << std::endl;
     std::cout << "  Scroll Up/Down    — Zoom in/out" << std::endl;
     std::cout << "  +/-               — Adjust FOV" << std::endl;
     std::cout << "  R                 — Reset camera" << std::endl;
+    std::cout << "  H                 — Toggle HUD" << std::endl;
+    std::cout << "  F12               — Save screenshot" << std::endl;
     std::cout << "  ESC               — Exit" << std::endl;
     std::cout << std::endl;
     std::cout << "Rendering first frame..." << std::endl;
@@ -221,6 +249,7 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv) {
     float prevCamDist = g_camera.distance;
     float prevCamTheta = g_camera.theta;
     float prevCamPhi = g_camera.phi;
+    float prevCamFov = g_camera.fov;
 
     // ====================================================================
     // Main Loop — continuous rendering (disk always rotating)
@@ -247,24 +276,27 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv) {
         // Detect if camera is still settling (moved since last frame)
         float camDelta = fabsf(g_camera.distance - prevCamDist)
                        + fabsf(g_camera.theta - prevCamTheta)
-                       + fabsf(g_camera.phi - prevCamPhi);
+                       + fabsf(g_camera.phi - prevCamPhi)
+                       + fabsf(g_camera.fov - prevCamFov) * 0.01f;  // Scale FOV to similar magnitude
         bool cameraMoving = g_camera.dragging || camDelta > 1e-4f;
         prevCamDist = g_camera.distance;
         prevCamTheta = g_camera.theta;
         prevCamPhi = g_camera.phi;
+        prevCamFov = g_camera.fov;
 
         // FPS display
         if (fpsUpdateTime >= 1.0) {
+            g_fps = frameCount / fpsUpdateTime;
             char title[256];
             const char* mode = g_tracer.isAvailable() ? "GPU" : "CPU";
             snprintf(title, sizeof(title),
                      "Kerr Black Hole [%s: %.1f FPS | Trace: %.0fms Shade: %.1fms | r=%.1fM θ=%.1f° a=%.3f]",
-                     mode, frameCount / fpsUpdateTime,
+                     mode, g_fps,
                      g_tracer.isAvailable() ? g_tracer.getLastTraceTimeMs() : 0.0,
                      g_tracer.isAvailable() ? g_tracer.getLastShadeTimeMs() : 0.0,
                      g_camera.distance,
                      g_camera.theta * 180.0f / 3.14159265f,
-                     BH_SPIN);
+                     g_config.spin);
             glfwSetWindowTitle(window, title);
             frameCount = 0;
             fpsUpdateTime = 0.0;
@@ -330,7 +362,9 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv) {
                 g_tracer.traceGeometry(g_camera, rw, rh);
             }
             if (g_tracer.hasGeometry()) {
-                g_tracer.shadeFrame(rw, rh, g_simTime);
+                // Fast path: GPU applies tone map + gamma → zero CPU per-pixel work
+                // Bloom path: GPU outputs HDR → CPU does tone map + bloom + gamma
+                g_tracer.shadeFrame(rw, rh, g_simTime, !doBloom);
                 std::vector<float>& tpix = g_tracer.getPixels();
                 if (!tpix.empty() && (int)tpix.size() == rw * rh * 4) {
                     pixelPtr = &tpix;
@@ -338,14 +372,14 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv) {
                 }
             }
         } else {
-            renderFrameCPU(g_camera, rw, rh, g_pixels, g_simTime);
+            renderFrameCPU(g_camera, rw, rh, g_pixels, g_simTime, g_config);
             if (!g_pixels.empty()) {
                 pixelPtr = &g_pixels;
                 gotPixels = true;
             }
         }
 
-        // If no valid pixel data, just display whatever is already in the texture
+        // If no valid pixel data, just display last good texture
         if (!gotPixels) {
             glClear(GL_COLOR_BUFFER_BIT);
             drawFullscreenQuad();
@@ -356,7 +390,8 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv) {
 
         std::vector<float>& pixels = *pixelPtr;
 
-        // Post-processing
+        // Post-processing — only for bloom frames or CPU fallback
+        // GPU fast path: pixels are already sRGB, skip entirely
         if (doBloom) {
             for (size_t i = 0; i < pixels.size(); i += 4) {
                 pixels[i + 0] = pixels[i + 0] / (1.0f + pixels[i + 0]);
@@ -365,15 +400,31 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv) {
             }
             applyBloom(pixels, rw, rh);
             applyGammaCorrection(pixels);
-        } else {
+        } else if (!g_tracer.isAvailable()) {
+            // CPU fallback needs tone map + gamma
+            initSRGBLUT();
             for (size_t i = 0; i < pixels.size(); i += 4) {
                 float r = pixels[i + 0] / (1.0f + pixels[i + 0]);
                 float g = pixels[i + 1] / (1.0f + pixels[i + 1]);
                 float b = pixels[i + 2] / (1.0f + pixels[i + 2]);
-                pixels[i + 0] = (r < 0.0031308f) ? (12.92f * r) : (1.055f * powf(r, 1.0f/2.4f) - 0.055f);
-                pixels[i + 1] = (g < 0.0031308f) ? (12.92f * g) : (1.055f * powf(g, 1.0f/2.4f) - 0.055f);
-                pixels[i + 2] = (b < 0.0031308f) ? (12.92f * b) : (1.055f * powf(b, 1.0f/2.4f) - 0.055f);
+                pixels[i + 0] = (r <= 0.0f) ? 0.0f : (r >= 1.0f) ? 1.0f : g_srgbLUT[(int)(r * 4096.0f)];
+                pixels[i + 1] = (g <= 0.0f) ? 0.0f : (g >= 1.0f) ? 1.0f : g_srgbLUT[(int)(g * 4096.0f)];
+                pixels[i + 2] = (b <= 0.0f) ? 0.0f : (b >= 1.0f) ? 1.0f : g_srgbLUT[(int)(b * 4096.0f)];
             }
+        }
+
+        // HUD overlay — draw text into pixel buffer
+        if (g_showHUD) {
+            drawHUD(pixels, rw, rh, g_camera, g_fps,
+                    g_tracer.isAvailable() ? g_tracer.getLastTraceTimeMs() : 0.0,
+                    g_tracer.isAvailable() ? g_tracer.getLastShadeTimeMs() : 0.0,
+                    g_config);
+        }
+
+        // Screenshot — save after all post-processing is applied
+        if (g_screenshotRequested) {
+            saveScreenshot(pixels, rw, rh);
+            g_screenshotRequested = false;
         }
 
         uploadPixelsToTexture(pixels, rw, rh);

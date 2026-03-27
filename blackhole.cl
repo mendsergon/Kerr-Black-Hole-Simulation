@@ -1,19 +1,29 @@
 // blackhole.cl — Kerr Black Hole Gravitational Lensing
 //
-// v1.1 — Split architecture: trace geodesics once (heavy), shade every frame (fast).
-//   raytrace kernel: integrates geodesics, writes geometry buffer
-//   shade kernel:    reads geometry buffer, computes colors with animated disk
-//
-// When camera moves → run raytrace (expensive)
-// When camera is still → run shade only (trivially fast, smooth animation)
+// v1.2 — Configurable parameters via OpenCL build-time defines.
+//   All #defines use #ifndef guards so CLI values override defaults.
 
+#ifndef M
 #define M       1.0f
+#endif
+#ifndef SPIN
 #define SPIN    0.998f
+#endif
+#ifndef DISK_INNER
 #define DISK_INNER  2.0f
+#endif
+#ifndef DISK_OUTER
 #define DISK_OUTER  20.0f
+#endif
+#ifndef MAX_STEPS
 #define MAX_STEPS   2000
+#endif
+#ifndef ESCAPE_R
 #define ESCAPE_R    50.0f
+#endif
+#ifndef HORIZON_EPS
 #define HORIZON_EPS 0.02f
+#endif
 #define PI 3.14159265359f
 
 // Max disk crossings stored per ray (primary + secondary + tertiary)
@@ -415,7 +425,8 @@ __kernel void shade(
     __global const float4* gbuf,
     __global float4* pixels,
     const int width, const int height,
-    const float sim_time
+    const float sim_time,
+    const int apply_tonemap  // 1 = output sRGB (fast path), 0 = output HDR (bloom path)
 ) {
     int idx = get_global_id(0);
     if (idx >= width * height) return;
@@ -463,6 +474,19 @@ __kernel void shade(
     if (hit_type > 0.5f && alpha < 1.0f) {
         float3 bg = compute_starfield(bg_theta, bg_phi);
         color += (1.0f - alpha) * bg;
+    }
+
+    // Optional: apply Reinhard tone mapping + sRGB gamma on GPU
+    // Eliminates CPU per-pixel post-processing on the fast path
+    if (apply_tonemap) {
+        // Reinhard
+        color.x = color.x / (1.0f + color.x);
+        color.y = color.y / (1.0f + color.y);
+        color.z = color.z / (1.0f + color.z);
+        // sRGB gamma (native_powr is fine for display math)
+        color.x = (color.x < 0.0031308f) ? (12.92f * color.x) : (1.055f * native_powr(color.x, 0.41666667f) - 0.055f);
+        color.y = (color.y < 0.0031308f) ? (12.92f * color.y) : (1.055f * native_powr(color.y, 0.41666667f) - 0.055f);
+        color.z = (color.z < 0.0031308f) ? (12.92f * color.z) : (1.055f * native_powr(color.z, 0.41666667f) - 0.055f);
     }
 
     pixels[idx] = (float4)(color, 1.0f);

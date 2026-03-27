@@ -5,12 +5,24 @@
 #include <sstream>
 #include <chrono>
 #include <algorithm>
+#include <cstring>
+#include <cstdio>
+#include <ctime>
+#include <sys/stat.h>
 
 // ============================================================================
-// Global GPU Ray Tracer Instance
+// Globals
 // ============================================================================
 
 GPURayTracer g_tracer;
+SimConfig g_config;
+
+// Compatibility macros — CPU physics code reads from config without mass edits
+#define BH_SPIN (g_config.spin)
+#define DISK_INNER (g_config.diskInner)
+#define DISK_OUTER (g_config.diskOuter)
+#define MAX_STEPS (g_config.maxSteps)
+#define HORIZON_THRESHOLD 0.01f
 
 // ============================================================================
 // GPURayTracer Implementation
@@ -39,7 +51,7 @@ GPURayTracer::~GPURayTracer() {
     cleanup();
 }
 
-bool GPURayTracer::initialize() {
+bool GPURayTracer::initialize(const SimConfig& config) {
     std::cout << "Initializing OpenCL GPU ray tracer..." << std::endl;
 
     if (!selectBestDevice()) {
@@ -52,7 +64,7 @@ bool GPURayTracer::initialize() {
         return false;
     }
 
-    if (!buildProgram()) {
+    if (!buildProgram(config)) {
         std::cerr << "Failed to build OpenCL program." << std::endl;
         cleanup();
         return false;
@@ -198,7 +210,7 @@ std::string GPURayTracer::loadKernelSource(const std::string& filename) {
     return "";
 }
 
-bool GPURayTracer::buildProgram() {
+bool GPURayTracer::buildProgram(const SimConfig& config) {
     cl_int err;
 
     std::string source = loadKernelSource("blackhole.cl");
@@ -215,8 +227,12 @@ bool GPURayTracer::buildProgram() {
         return false;
     }
 
-    // Build with fast math for GPU performance
-    const char* options = "-cl-fast-relaxed-math -cl-mad-enable";
+    // Build with config values injected as defines
+    char options[512];
+    snprintf(options, sizeof(options),
+             "-cl-fast-relaxed-math -cl-mad-enable "
+             "-DSPIN=%.6ff -DDISK_INNER=%.2ff -DDISK_OUTER=%.2ff -DMAX_STEPS=%d",
+             config.spin, config.diskInner, config.diskOuter, config.maxSteps);
     err = clBuildProgram(m_program, 1, &m_device, options, nullptr, nullptr);
     if (err != CL_SUCCESS) {
         size_t logSize;
@@ -303,7 +319,7 @@ void GPURayTracer::traceGeometry(const Camera& camera, int width, int height) {
     m_lastTraceTimeMs = std::chrono::duration<double, std::milli>(endTime - startTime).count();
 }
 
-void GPURayTracer::shadeFrame(int width, int height, float simTime) {
+void GPURayTracer::shadeFrame(int width, int height, float simTime, bool applyTonemap) {
     if (!m_initialized || !m_gbufValid) return;
 
     // If resolution changed since trace, g-buffer is stale — need re-trace
@@ -314,12 +330,15 @@ void GPURayTracer::shadeFrame(int width, int height, float simTime) {
 
     auto startTime = std::chrono::high_resolution_clock::now();
 
+    int tonemapFlag = applyTonemap ? 1 : 0;
+
     // Set shade kernel arguments — reads g-buffer, writes pixels
     clSetKernelArg(m_shadeKernel, 0, sizeof(cl_mem), &m_gbufBuffer);
     clSetKernelArg(m_shadeKernel, 1, sizeof(cl_mem), &m_pixelBuffer);
     clSetKernelArg(m_shadeKernel, 2, sizeof(int), &width);
     clSetKernelArg(m_shadeKernel, 3, sizeof(int), &height);
     clSetKernelArg(m_shadeKernel, 4, sizeof(float), &simTime);
+    clSetKernelArg(m_shadeKernel, 5, sizeof(int), &tonemapFlag);
 
     size_t totalPixels = width * height;
     size_t localSize = 256;
@@ -539,11 +558,12 @@ glm::vec3 starfield_color(float theta, float phi) {
 
 } // namespace cpu
 
-void renderFrameCPU(const Camera& camera, int width, int height, std::vector<float>& pixels, float simTime) {
+void renderFrameCPU(const Camera& camera, int width, int height, std::vector<float>& pixels,
+                    float simTime, const SimConfig& /* config — read via g_config macros */) {
     pixels.resize(width * height * 4);
     float cam_fov_rad = camera.fov * cpu::PI / 180.0f;
     float aspect = (float)width / (float)height;
-    float half_fov = cam_fov_rad * 0.5f;
+    float tan_hfov = tanf(cam_fov_rad * 0.5f);  // Hoisted out of parallel loop
     float r_horizon = BH_MASS + sqrtf(BH_MASS * BH_MASS - BH_SPIN * BH_SPIN);
 
     // Process each pixel (slow on CPU but works without GPU)
@@ -554,8 +574,8 @@ void renderFrameCPU(const Camera& camera, int width, int height, std::vector<flo
 
         float ndc_x = (2.0f * (px + 0.5f) / width - 1.0f) * aspect;
         float ndc_y = (2.0f * (py + 0.5f) / height - 1.0f);
-        float sx = ndc_x * tanf(half_fov);
-        float sy = -ndc_y * tanf(half_fov);
+        float sx = ndc_x * tan_hfov;
+        float sy = -ndc_y * tan_hfov;
 
         float ray_len = sqrtf(sx * sx + sy * sy + 1.0f);
         float n_r   =  1.0f / ray_len;
@@ -650,12 +670,12 @@ void renderFrameCPU(const Camera& camera, int width, int height, std::vector<flo
 // Camera Factory
 // ============================================================================
 
-Camera createDefaultCamera() {
+Camera createDefaultCamera(const SimConfig& config) {
     Camera cam;
-    cam.distance = 25.0f;                  // 25M from the black hole
-    cam.theta = 1.3f;                      // Slightly above equatorial plane (~74°)
-    cam.phi = 0.0f;                        // Initial azimuthal angle
-    cam.fov = 60.0f;                       // 60 degree field of view
+    cam.distance = config.camDistance;
+    cam.theta = config.camTheta;
+    cam.phi = 0.0f;
+    cam.fov = config.camFov;
     cam.targetDistance = cam.distance;
     cam.targetTheta = cam.theta;
     cam.targetPhi = cam.phi;
@@ -671,7 +691,6 @@ Camera createDefaultCamera() {
 // ============================================================================
 
 void applyBloom(std::vector<float>& pixels, int width, int height) {
-    // Extract bright pixels into separate buffer
     int size = width * height * 4;
     std::vector<float> bright(size, 0.0f);
     float threshold = 0.75f;
@@ -686,23 +705,20 @@ void applyBloom(std::vector<float>& pixels, int width, int height) {
         }
     }
 
-    // Gaussian blur radius scales with resolution
     int radius = std::max(2, width / 80);
     float sigma = (float)radius / 2.0f;
 
-    // Precompute 1D Gaussian weights
     std::vector<float> weights(radius + 1);
     float weightSum = 0.0f;
     for (int i = 0; i <= radius; i++) {
         weights[i] = expf(-(float)(i * i) / (2.0f * sigma * sigma));
         weightSum += (i == 0) ? weights[i] : 2.0f * weights[i];
     }
-    for (int i = 0; i <= radius; i++) {
-        weights[i] /= weightSum;
-    }
+    for (int i = 0; i <= radius; i++) weights[i] /= weightSum;
 
-    // Horizontal blur pass
+    // Horizontal blur — reuse bright as output after reading
     std::vector<float> temp(size, 0.0f);
+    #pragma omp parallel for schedule(static)
     for (int y = 0; y < height; y++) {
         for (int x = 0; x < width; x++) {
             float r = 0, g = 0, b = 0;
@@ -721,8 +737,8 @@ void applyBloom(std::vector<float>& pixels, int width, int height) {
         }
     }
 
-    // Vertical blur pass
-    std::vector<float> blurred(size, 0.0f);
+    // Vertical blur — write directly into bright (reuse allocation)
+    #pragma omp parallel for schedule(static)
     for (int y = 0; y < height; y++) {
         for (int x = 0; x < width; x++) {
             float r = 0, g = 0, b = 0;
@@ -735,35 +751,298 @@ void applyBloom(std::vector<float>& pixels, int width, int height) {
                 b += temp[idx + 2] * w;
             }
             int idx = (y * width + x) * 4;
-            blurred[idx + 0] = r;
-            blurred[idx + 1] = g;
-            blurred[idx + 2] = b;
+            bright[idx + 0] = r;
+            bright[idx + 1] = g;
+            bright[idx + 2] = b;
         }
     }
 
-    // Composite bloom back onto original
+    // Composite
     float bloomStrength = 0.4f;
     for (int i = 0; i < size; i += 4) {
-        pixels[i + 0] = std::min(1.0f, pixels[i + 0] + blurred[i + 0] * bloomStrength);
-        pixels[i + 1] = std::min(1.0f, pixels[i + 1] + blurred[i + 1] * bloomStrength);
-        pixels[i + 2] = std::min(1.0f, pixels[i + 2] + blurred[i + 2] * bloomStrength);
+        pixels[i + 0] = std::min(1.0f, pixels[i + 0] + bright[i + 0] * bloomStrength);
+        pixels[i + 1] = std::min(1.0f, pixels[i + 1] + bright[i + 1] * bloomStrength);
+        pixels[i + 2] = std::min(1.0f, pixels[i + 2] + bright[i + 2] * bloomStrength);
     }
 }
 
 // ============================================================================
-// Post-Processing: sRGB Gamma Correction
+// Post-Processing: sRGB Gamma Correction (LUT-accelerated)
 // ============================================================================
+
+// Precomputed LUT: maps linear [0,1] to sRGB [0,1] in 4096 steps
+float g_srgbLUT[4097];
+static bool g_srgbLUTReady = false;
+
+void initSRGBLUT() {
+    if (g_srgbLUTReady) return;
+    for (int i = 0; i <= 4096; i++) {
+        float x = (float)i / 4096.0f;
+        g_srgbLUT[i] = (x < 0.0031308f) ? (12.92f * x) : (1.055f * powf(x, 1.0f / 2.4f) - 0.055f);
+    }
+    g_srgbLUTReady = true;
+}
 
 static inline float linearToSRGB(float x) {
     if (x <= 0.0f) return 0.0f;
     if (x >= 1.0f) return 1.0f;
-    return (x < 0.0031308f) ? (12.92f * x) : (1.055f * powf(x, 1.0f / 2.4f) - 0.055f);
+    return g_srgbLUT[(int)(x * 4096.0f)];
 }
 
 void applyGammaCorrection(std::vector<float>& pixels) {
+    initSRGBLUT();
     for (size_t i = 0; i < pixels.size(); i += 4) {
         pixels[i + 0] = linearToSRGB(pixels[i + 0]);
         pixels[i + 1] = linearToSRGB(pixels[i + 1]);
         pixels[i + 2] = linearToSRGB(pixels[i + 2]);
     }
+}
+
+// ============================================================================
+// Command-Line Argument Parser
+// ============================================================================
+
+SimConfig parseArgs(int argc, char** argv) {
+    SimConfig cfg;
+    for (int i = 1; i < argc; i++) {
+        std::string arg = argv[i];
+        if (arg == "--help" || arg == "-h") {
+            std::cout << "Kerr Black Hole Simulation v1.2\n\n"
+                      << "Usage: ./blackhole [options]\n\n"
+                      << "Options:\n"
+                      << "  --spin <float>       Spin parameter a/M (default: 0.998)\n"
+                      << "  --disk-inner <float> Inner disk radius in M (default: 2.0)\n"
+                      << "  --disk-outer <float> Outer disk radius in M (default: 20.0)\n"
+                      << "  --steps <int>        Max RK4 steps per ray (default: 2000)\n"
+                      << "  --width <int>        Window width (default: 1280)\n"
+                      << "  --height <int>       Window height (default: 720)\n"
+                      << "  --distance <float>   Camera distance in M (default: 25.0)\n"
+                      << "  --theta <float>      Camera polar angle in degrees (default: 74.5)\n"
+                      << "  --fov <float>        Field of view in degrees (default: 60.0)\n"
+                      << "  --help               Show this help\n";
+            exit(0);
+        }
+        if (i + 1 < argc) {
+            if (arg == "--spin")       cfg.spin = std::stof(argv[++i]);
+            else if (arg == "--disk-inner") cfg.diskInner = std::stof(argv[++i]);
+            else if (arg == "--disk-outer") cfg.diskOuter = std::stof(argv[++i]);
+            else if (arg == "--steps")      cfg.maxSteps = std::stoi(argv[++i]);
+            else if (arg == "--width")      cfg.windowWidth = std::stoi(argv[++i]);
+            else if (arg == "--height")     cfg.windowHeight = std::stoi(argv[++i]);
+            else if (arg == "--distance")   cfg.camDistance = std::stof(argv[++i]);
+            else if (arg == "--theta")      cfg.camTheta = std::stof(argv[++i]) * 3.14159265f / 180.0f;
+            else if (arg == "--fov")        cfg.camFov = std::stof(argv[++i]);
+        }
+    }
+    // Clamp spin to valid range
+    if (cfg.spin < 0.0f) cfg.spin = 0.0f;
+    if (cfg.spin >= 1.0f) cfg.spin = 0.999f;
+    return cfg;
+}
+
+// ============================================================================
+// Screenshot — saves as PPM (no library dependency)
+// ============================================================================
+
+void saveScreenshot(const std::vector<float>& pixels, int width, int height) {
+    // Create Screenshots directory if it doesn't exist
+    std::string dir = "Screenshots";
+    #ifdef _WIN32
+    _mkdir(dir.c_str());
+    #else
+    mkdir(dir.c_str(), 0755);
+    #endif
+
+    time_t now = time(nullptr);
+    struct tm* t = localtime(&now);
+    char filename[256];
+    snprintf(filename, sizeof(filename), "Screenshots/blackhole_%04d%02d%02d_%02d%02d%02d.ppm",
+             t->tm_year + 1900, t->tm_mon + 1, t->tm_mday,
+             t->tm_hour, t->tm_min, t->tm_sec);
+
+    std::ofstream file(filename, std::ios::binary);
+    if (!file.is_open()) {
+        std::cerr << "Failed to save screenshot: " << filename << std::endl;
+        return;
+    }
+
+    file << "P6\n" << width << " " << height << "\n255\n";
+    for (int i = 0; i < width * height; i++) {
+        unsigned char r = (unsigned char)(std::min(1.0f, std::max(0.0f, pixels[i * 4 + 0])) * 255.0f);
+        unsigned char g = (unsigned char)(std::min(1.0f, std::max(0.0f, pixels[i * 4 + 1])) * 255.0f);
+        unsigned char b = (unsigned char)(std::min(1.0f, std::max(0.0f, pixels[i * 4 + 2])) * 255.0f);
+        file.write((char*)&r, 1);
+        file.write((char*)&g, 1);
+        file.write((char*)&b, 1);
+    }
+
+    file.close();
+    std::cout << "Screenshot saved: " << filename << std::endl;
+}
+
+// ============================================================================
+// HUD — embedded 4x6 bitmap font, drawn into pixel buffer
+// ============================================================================
+
+// Tiny 4x6 font covering ASCII 32-127 (space through ~)
+// Each character is 4 pixels wide, 6 tall, packed as 3 bytes (24 bits = 4*6)
+static const unsigned char g_font4x6[][3] = {
+    {0x00,0x00,0x00}, // 32 space
+    {0x44,0x40,0x40}, // 33 !
+    {0xAA,0x00,0x00}, // 34 "
+    {0xAE,0xAE,0xA0}, // 35 #
+    {0x6C,0x6C,0x40}, // 36 $
+    {0xA2,0x48,0xA0}, // 37 %
+    {0x4A,0x4A,0x50}, // 38 &
+    {0x44,0x00,0x00}, // 39 '
+    {0x24,0x44,0x20}, // 40 (
+    {0x42,0x22,0x40}, // 41 )
+    {0xA4,0xA0,0x00}, // 42 *
+    {0x04,0xE4,0x00}, // 43 +
+    {0x00,0x02,0x40}, // 44 ,
+    {0x00,0xE0,0x00}, // 45 -
+    {0x00,0x00,0x40}, // 46 .
+    {0x22,0x48,0x80}, // 47 /
+    {0x4A,0xAA,0x40}, // 48 0
+    {0x4C,0x44,0xE0}, // 49 1
+    {0xC2,0x48,0xE0}, // 50 2
+    {0xC2,0x42,0xC0}, // 51 3
+    {0xAA,0xE2,0x20}, // 52 4
+    {0xE8,0xC2,0xC0}, // 53 5
+    {0x68,0xEA,0xE0}, // 54 6
+    {0xE2,0x44,0x40}, // 55 7
+    {0xEA,0xEA,0xE0}, // 56 8
+    {0xEA,0xE2,0xC0}, // 57 9
+    {0x04,0x04,0x00}, // 58 :
+    {0x04,0x02,0x40}, // 59 ;
+    {0x24,0x82,0x00}, // 60 <
+    {0x0E,0x0E,0x00}, // 61 =
+    {0x82,0x48,0x00}, // 62 >
+    {0xC2,0x40,0x40}, // 63 ?
+    {0x4A,0xE8,0x60}, // 64 @
+    {0x4A,0xEA,0xA0}, // 65 A
+    {0xCA,0xCA,0xC0}, // 66 B
+    {0x68,0x88,0x60}, // 67 C
+    {0xCA,0xAA,0xC0}, // 68 D
+    {0xE8,0xC8,0xE0}, // 69 E
+    {0xE8,0xC8,0x80}, // 70 F
+    {0x68,0xAA,0x60}, // 71 G
+    {0xAA,0xEA,0xA0}, // 72 H
+    {0xE4,0x44,0xE0}, // 73 I
+    {0x22,0x2A,0x40}, // 74 J
+    {0xAA,0xCA,0xA0}, // 75 K
+    {0x88,0x88,0xE0}, // 76 L
+    {0xAE,0xAA,0xA0}, // 77 M
+    {0xCA,0xAA,0xA0}, // 78 N
+    {0x4A,0xAA,0x40}, // 79 O
+    {0xCA,0xC8,0x80}, // 80 P
+    {0x4A,0xAC,0x60}, // 81 Q
+    {0xCA,0xCA,0xA0}, // 82 R
+    {0x68,0x42,0xC0}, // 83 S
+    {0xE4,0x44,0x40}, // 84 T
+    {0xAA,0xAA,0xE0}, // 85 U
+    {0xAA,0xAA,0x40}, // 86 V
+    {0xAA,0xAE,0xA0}, // 87 W
+    {0xAA,0x4A,0xA0}, // 88 X
+    {0xAA,0x44,0x40}, // 89 Y
+    {0xE2,0x48,0xE0}, // 90 Z
+    {0x64,0x44,0x60}, // 91 [
+    {0x88,0x42,0x20}, // 92 backslash
+    {0x62,0x22,0x60}, // 93 ]
+    {0x4A,0x00,0x00}, // 94 ^
+    {0x00,0x00,0xE0}, // 95 _
+    {0x42,0x00,0x00}, // 96 `
+    {0x06,0xAA,0x60}, // 97 a
+    {0x8C,0xAA,0xC0}, // 98 b
+    {0x06,0x88,0x60}, // 99 c
+    {0x26,0xAA,0x60}, // 100 d
+    {0x04,0xAC,0x60}, // 101 e
+    {0x24,0xE4,0x40}, // 102 f
+    {0x06,0xA6,0x2C}, // 103 g
+    {0x8C,0xAA,0xA0}, // 104 h
+    {0x40,0x44,0x40}, // 105 i
+    {0x20,0x22,0xA4}, // 106 j
+    {0x8A,0xCA,0xA0}, // 107 k
+    {0xC4,0x44,0xE0}, // 108 l
+    {0x0A,0xEA,0xA0}, // 109 m
+    {0x0C,0xAA,0xA0}, // 110 n
+    {0x04,0xAA,0x40}, // 111 o
+    {0x0C,0xAC,0x80}, // 112 p
+    {0x06,0xA6,0x20}, // 113 q
+    {0x06,0x88,0x80}, // 114 r
+    {0x06,0xC2,0xC0}, // 115 s
+    {0x4E,0x44,0x20}, // 116 t
+    {0x0A,0xAA,0x60}, // 117 u
+    {0x0A,0xAA,0x40}, // 118 v
+    {0x0A,0xAE,0xA0}, // 119 w
+    {0x0A,0x4A,0xA0}, // 120 x
+    {0x0A,0xA6,0x2C}, // 121 y
+    {0x0E,0x24,0xE0}, // 122 z
+    {0x24,0x84,0x20}, // 123 {
+    {0x44,0x44,0x40}, // 124 |
+    {0x84,0x24,0x80}, // 125 }
+    {0x5A,0x00,0x00}, // 126 ~
+};
+
+// Get pixel bit for character at (cx, cy) within 4x6 glyph
+static bool fontPixel(char ch, int cx, int cy) {
+    if (ch < 32 || ch > 126) return false;
+    int idx = ch - 32;
+    // 24 bits packed into 3 bytes, row-major, 4 pixels per row
+    int bit = cy * 4 + cx;
+    int byteIdx = bit / 8;
+    int bitIdx = 7 - (bit % 8);
+    return (g_font4x6[idx][byteIdx] >> bitIdx) & 1;
+}
+
+// Draw a string into pixel buffer at (x, y) with scale factor
+static void drawString(std::vector<float>& pixels, int width, int height,
+                       int startX, int startY, const char* text, int scale,
+                       float r, float g, float b) {
+    int curX = startX;
+    for (int i = 0; text[i] != '\0'; i++) {
+        if (text[i] == '\n') {
+            curX = startX;
+            startY += 7 * scale;
+            continue;
+        }
+        for (int cy = 0; cy < 6; cy++) {
+            for (int cx = 0; cx < 4; cx++) {
+                if (fontPixel(text[i], cx, cy)) {
+                    for (int sy = 0; sy < scale; sy++) {
+                        for (int sx = 0; sx < scale; sx++) {
+                            int px = curX + cx * scale + sx;
+                            int py = startY + cy * scale + sy;
+                            if (px >= 0 && px < width && py >= 0 && py < height) {
+                                int idx = (py * width + px) * 4;
+                                pixels[idx + 0] = r;
+                                pixels[idx + 1] = g;
+                                pixels[idx + 2] = b;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        curX += 5 * scale;
+    }
+}
+
+void drawHUD(std::vector<float>& pixels, int width, int height,
+             const Camera& camera, double fps, double traceMs, double shadeMs,
+             const SimConfig& config) {
+    char buf[512];
+    snprintf(buf, sizeof(buf),
+             "a=%.3f  r=%.1fM  th=%.1f  fov=%.0f\n"
+             "%.0f FPS  trace:%.0fms  shade:%.1fms\n"
+             "disk: %.0f-%.0fM  steps:%d",
+             config.spin, camera.distance,
+             camera.theta * 180.0f / 3.14159265f,
+             camera.fov,
+             fps, traceMs, shadeMs,
+             config.diskInner, config.diskOuter, config.maxSteps);
+
+    int scale = std::max(1, width / 640);  // Scale with resolution
+    drawString(pixels, width, height, 4 * scale, 4 * scale, buf, scale,
+               1.0f, 1.0f, 1.0f);
 }

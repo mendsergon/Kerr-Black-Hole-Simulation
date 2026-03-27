@@ -10,31 +10,26 @@
 #include <CL/cl.h>
 
 // ============================================================================
-// Physical Constants (geometrized units: G = c = 1)
+// Simulation Configuration (all overridable via command line)
 // ============================================================================
 
-// Black hole mass — sets the scale of the simulation
-// In geometrized units, M defines the Schwarzschild radius: r_s = 2M
+struct SimConfig {
+    float spin = 0.998f;          // Kerr spin parameter a/M
+    float diskInner = 2.0f;       // Inner disk radius (units of M)
+    float diskOuter = 20.0f;      // Outer disk radius
+    int   maxSteps = 2000;        // Max RK4 steps per ray
+    int   windowWidth = 1280;     // Initial window width
+    int   windowHeight = 720;     // Initial window height
+    float camDistance = 25.0f;    // Initial camera distance
+    float camTheta = 1.3f;       // Initial camera polar angle (rad)
+    float camFov = 60.0f;        // Initial FOV (degrees)
+};
+
+// Parse command-line arguments into config
+SimConfig parseArgs(int argc, char** argv);
+
+// Physical constants (not configurable)
 const float BH_MASS = 1.0f;
-
-// Black hole spin parameter: a = J / (M * c)
-// Range [0, 1): 0 = Schwarzschild (non-spinning), ~1 = extremal Kerr
-// Interstellar's Gargantua uses a ≈ 0.9999 — we use 0.998 for stability
-const float BH_SPIN = 0.998f;
-
-// Accretion disk inner and outer radii (in units of M)
-// ISCO for a = 0.998 prograde is ~1.24M, we use a slightly larger value
-const float DISK_INNER = 2.0f;
-const float DISK_OUTER = 20.0f;
-
-// Ray marching parameters
-const int MAX_STEPS = 2000;        // Maximum integration steps per ray
-const float STEP_SIZE = 0.04f;     // Base RK4 step size (adaptive near BH)
-const float HORIZON_THRESHOLD = 0.01f; // Stop ray when this close to horizon
-
-// Render resolution
-const int RENDER_WIDTH = 1280;
-const int RENDER_HEIGHT = 720;
 
 // ============================================================================
 // Camera State
@@ -68,7 +63,7 @@ public:
     ~GPURayTracer();
 
     // Initialize OpenCL with best available GPU
-    bool initialize();
+    bool initialize(const SimConfig& config);
 
     // Clean up all OpenCL resources
     void cleanup();
@@ -77,7 +72,8 @@ public:
     void traceGeometry(const Camera& camera, int width, int height);
 
     // Shade from cached geometry — reads g-buffer, writes pixels (cheap, call every frame)
-    void shadeFrame(int width, int height, float simTime);
+    // applyTonemap: true = output sRGB (fast path), false = output HDR (for bloom)
+    void shadeFrame(int width, int height, float simTime, bool applyTonemap = true);
 
     // Get mutable reference to pixel data (avoid copying every frame)
     std::vector<float>& getPixels() { return m_pixels; }
@@ -125,7 +121,7 @@ private:
     // Helper methods
     bool selectBestDevice();
     bool createContext();
-    bool buildProgram();
+    bool buildProgram(const SimConfig& config);
     bool createBuffers(int width, int height);
     std::string loadKernelSource(const std::string& filename);
 };
@@ -135,23 +131,37 @@ private:
 // ============================================================================
 
 // Trace all rays on CPU when GPU is unavailable
-void renderFrameCPU(const Camera& camera, int width, int height, std::vector<float>& pixels, float simTime);
+void renderFrameCPU(const Camera& camera, int width, int height, std::vector<float>& pixels,
+                    float simTime, const SimConfig& config);
 
 // ============================================================================
-// Global GPU Ray Tracer Instance
+// Global Instances
 // ============================================================================
 
 extern GPURayTracer g_tracer;
+extern SimConfig g_config;
 
 // ============================================================================
 // Utility Functions
 // ============================================================================
 
-// Create default camera positioned to see the full lensing effect
-Camera createDefaultCamera();
+// Create default camera from config
+Camera createDefaultCamera(const SimConfig& config);
 
 // Post-processing: bloom glow and gamma correction
 void applyBloom(std::vector<float>& pixels, int width, int height);
 void applyGammaCorrection(std::vector<float>& pixels);
+
+// sRGB gamma LUT — precomputed, accessible for inline use in main loop
+extern float g_srgbLUT[4097];
+void initSRGBLUT();  // Call once before using g_srgbLUT
+
+// Save screenshot as PPM (no library dependency)
+void saveScreenshot(const std::vector<float>& pixels, int width, int height);
+
+// Draw HUD text into pixel buffer (embedded bitmap font)
+void drawHUD(std::vector<float>& pixels, int width, int height,
+             const Camera& camera, double fps, double traceMs, double shadeMs,
+             const SimConfig& config);
 
 #endif // BLACKHOLE_H
