@@ -8,6 +8,8 @@ A real-time **gravitational lensing ray tracer** for a spinning (Kerr) black hol
 ![Platform](https://img.shields.io/badge/Platform-Linux-lightgrey)
 ![License](https://img.shields.io/badge/License-MIT-yellow)
 
+![Preview](Previews/preview.jpg)
+
 ---
 
 ## What's New in v1.2
