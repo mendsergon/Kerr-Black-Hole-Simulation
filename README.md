@@ -8,8 +8,6 @@ A real-time **gravitational lensing ray tracer** for a spinning (Kerr) black hol
 ![Platform](https://img.shields.io/badge/Platform-Linux-lightgrey)
 ![License](https://img.shields.io/badge/License-MIT-yellow)
 
-![Preview](Previews/preview.jpg)
-
 ---
 
 ## What's New in v1.2
@@ -367,7 +365,7 @@ The renderer uses a two-kernel architecture to separate expensive geodesic integ
 | `raytrace` | 50–200 ms | Camera moves | Traces geodesics, writes geometry buffer (hit type, disk crossings, exit angles) |
 | `shade` | 1–3 ms | Every frame | Reads g-buffer, computes colors with animated disk rotation, tone mapping, gamma |
 
-When the camera is still, only the shade kernel runs — smooth 60fps animation at full resolution.
+When the camera is still, only the shade kernel runs — smooth animation at full resolution.
 
 ### Resolution Tiers
 
@@ -414,7 +412,7 @@ If no GPU is detected, the simulation falls back to CPU computation with OpenMP 
 
 | Configuration | Resolution | Trace Time | Shade Time | Animation FPS |
 |--------------|------------|------------|------------|---------------|
-| Discrete GPU (RDNA3) | 1280×720 | 50–200 ms | 1–3 ms | 50–60+ |
+| Discrete GPU (RDNA3) | 1280×720 | 50–200 ms | 1–3 ms | smooth |
 | Discrete GPU (RDNA3) | 2560×1440 (60%) | 100–400 ms | 3–8 ms | ~50 |
 | Discrete GPU | 640×360 (drag) | 10–30 ms | <1 ms | Smooth |
 | Integrated GPU | 1280×720 | 500–2000 ms | 10–50 ms | Low |
@@ -444,10 +442,10 @@ The trace kernel (geodesic integration) is the expensive operation — up to 200
 
 | File | Lines | Description |
 |------|-------|-------------|
-| `main.cpp` | 452 | GLFW window, OpenGL, camera controls, trace/shade render loop, post-processing |
-| `blackhole.h` | 167 | SimConfig, Camera, GPURayTracer class, function declarations |
-| `blackhole.cpp` | 1048 | GPU init, kernel management, CPU fallback, bloom, gamma LUT, HUD, screenshots, CLI parser |
-| `blackhole.cl` | 493 | Two OpenCL kernels: `raytrace` (geodesic integration → g-buffer) and `shade` (g-buffer → pixels) |
+| `main.cpp` | ~450 | GLFW window, OpenGL, camera controls, trace/shade render loop, post-processing |
+| `blackhole.h` | ~165 | SimConfig, Camera, GPURayTracer class, function declarations |
+| `blackhole.cpp` | ~1030 | GPU init, kernel management, CPU fallback, bloom, gamma LUT, HUD, screenshots, CLI parser |
+| `blackhole.cl` | ~490 | Two OpenCL kernels: `raytrace` (geodesic integration → g-buffer) and `shade` (g-buffer → pixels) |
 | `Makefile` | 62 | Cross-platform build with auto dependency detection |
 
 ---
