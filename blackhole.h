@@ -17,7 +17,7 @@ struct SimConfig {
     float spin = 0.998f;          // Kerr spin parameter a/M
     float diskInner = 2.0f;       // Inner disk radius (units of M)
     float diskOuter = 20.0f;      // Outer disk radius
-    int   maxSteps = 2000;        // Max RK4 steps per ray
+    int   maxSteps = 4000;        // Max RK4 steps per ray
     int   windowWidth = 1280;     // Initial window width
     int   windowHeight = 720;     // Initial window height
     float camDistance = 25.0f;    // Initial camera distance

@@ -1,5 +1,5 @@
 # Kerr Black Hole Gravitational Lensing Simulation
-### v1.2.0 — GPU Accelerated Ray Tracer
+### v1.2.1 — GPU Accelerated Ray Tracer
 
 A real-time **gravitational lensing ray tracer** for a spinning (Kerr) black hole with an accretion disk. Uses a **trace/shade split architecture** — geodesics traced once via **OpenCL** GPU compute, then re-shaded every frame for smooth disk animation. **OpenGL/GLFW** display with interactive orbital camera, bloom post-processing, and configurable parameters via command line.
 
@@ -7,6 +7,21 @@ A real-time **gravitational lensing ray tracer** for a spinning (Kerr) black hol
 ![GPU](https://img.shields.io/badge/Acceleration-OpenCL-green)
 ![Platform](https://img.shields.io/badge/Platform-Linux-lightgrey)
 ![License](https://img.shields.io/badge/License-MIT-yellow)
+
+![Preview](Previews/preview.jpg)
+
+---
+
+## What's New in v1.2.1
+
+Visual detail improvements on top of v1.2. Same architecture — animation stays at full framerate.
+
+| Feature | Description |
+|---------|-------------|
+| Higher-order photon rings | 4000 integration steps (was 2000) with 5-tier adaptive step sizing. Resolves tertiary disk images — thin bright arcs wrapping over the shadow edge. |
+| Procedural turbulence | 3-octave FBM noise modulates disk temperature at each crossing. Hotspots and spiral structure evolve with rotation. |
+| ISCO emissivity spike | Bright inner ring at the innermost stable orbit — physically motivated by the plunging region. |
+| Gravitational redshift on stars | Stars near the shadow edge are dimmed and reddened based on closest approach. |
 
 ---
 
@@ -303,69 +318,88 @@ For each pixel, the algorithm proceeds as:
 
 ### Geometry
 
-The accretion disk is modeled as a **geometrically thin, optically thick disk** in the equatorial plane (θ = π/2), extending from r = 2M (inner edge) to r = 20M (outer edge).
+The accretion disk is modeled as a **geometrically thin disk** in the equatorial plane (θ = π/2), extending from r = 2M (inner edge) to r = 20M (outer edge). Rays that cross the equatorial plane within the disk radii register a hit. Multiple crossings are recorded (up to 3 per ray), producing primary, secondary, and higher-order lensed images.
 
 The inner edge is chosen slightly outside the innermost stable circular orbit (ISCO). For a prograde orbit around a Kerr black hole with a = 0.998M, the ISCO is at r ≈ 1.24M. We use r = 2M for visual clarity.
 
+### Radiative Transfer
+
+At each equatorial crossing, the disk contributes emission and opacity via front-to-back compositing:
+
+```
+color += (1 - alpha) × opacity × emission(r, φ, t)
+alpha += (1 - alpha) × opacity
+```
+
+The emission at each crossing is computed in the shade kernel with animated rotation, procedural noise, Doppler beaming, and ISCO glow — all evaluated per-frame for smooth animation without re-tracing.
+
 ### Temperature Profile
 
-The disk temperature follows the standard thin-disk temperature profile, simplified as:
+The base disk temperature follows the standard thin-disk profile:
 
 ```
 T(r) ∝ (r_inner / r)^(3/4)
 ```
 
-This gives a normalized temperature T ∈ [0, 1] that is hottest at the inner edge and falls off with radius.
+This is modulated by three effects: Doppler beaming (brightness asymmetry), procedural turbulence (hotspots and structure), and an ISCO emissivity spike (bright inner ring).
+
+### ISCO Emissivity Spike
+
+At the innermost stable circular orbit, matter transitions from orderly circular flow to a plunge toward the horizon. This transition region emits intensely:
+
+```
+boost = 1 + 3 × exp(-(r - r_ISCO)² / 0.5)
+```
+
+This produces a physically motivated bright inner ring.
+
+### Procedural Turbulence
+
+Real accretion disks exhibit magnetohydrodynamic turbulence. We approximate this with 3-octave fractal Brownian motion noise evaluated at (r, φ, t):
+
+```
+turb = fbm3(r × 0.8, φ_disk × 1.5, t × 0.15)
+T_final = T_base × doppler × (0.6 + 0.8 × turb)
+```
+
+The noise creates hotspots, spiral density waves, and filamentary structure that evolve over time as the disk rotates.
 
 ### Doppler Beaming
 
-The accretion disk material orbits the black hole at approximately the Keplerian velocity:
+The accretion disk material orbits at approximately the Keplerian velocity:
 
 ```
 v_orb = 1 / (√r + a)     (prograde circular orbit in Kerr)
 ```
 
-The Doppler factor for radiation from moving material is:
+The Doppler factor is:
 
 ```
 g = 1 / (γ(1 + v_orb sin φ))
 ```
 
-where γ = 1/√(1 - v²) is the Lorentz factor and φ is the azimuthal angle of the emission point. This factor accounts for both the classical Doppler shift and the relativistic time dilation.
-
-The observed temperature and intensity are boosted:
-
-```
-T_observed = T_emitted × g
-I_observed = I_emitted × g⁴
-```
-
-The g⁴ factor (relativistic beaming) causes the approaching side of the disk to appear dramatically brighter than the receding side — this is the pronounced asymmetry visible in the simulation.
+where γ = 1/√(1 - v²). The observed intensity scales as I ∝ g⁴ (relativistic beaming), causing the approaching side to appear dramatically brighter.
 
 ### The "Ring Bend" — Gravitational Lensing of the Disk
 
-The most striking visual feature is the disk appearing to wrap around the black hole. This happens because:
+The most striking visual feature is the disk appearing to wrap around the black hole. Photons from the far side are deflected over the top and bottom by extreme curvature, arriving at the camera from above and below the silhouette. With the volumetric model, rays passing through the disk volume at oblique angles accumulate more color than those passing through edge-on, producing natural limb-brightening effects.
 
-1. Photons emitted from the **far side** of the disk (behind the black hole) are deflected over the top and under the bottom by the extreme curvature
-2. These photons arrive at the camera from **above and below** the black hole's silhouette
-3. The result is a bright arc — the same disk, gravitationally lensed — visible above and below the shadow
-
-In the simulation, this is captured naturally: when a ray is traced backward from the camera, it curves around the black hole and intersects the equatorial plane on the far side, recovering the far-side disk emission. Rays can cross the equatorial plane **multiple times**, producing the primary image (direct path) and higher-order images (photons that orbit one or more times before reaching the camera).
+With 4000 integration steps and finer step sizes near the photon sphere (h = 0.004 at r < 2.5M), rays that orbit one or more times before escaping resolve tertiary and quaternary disk images — thin bright rings stacked progressively closer to the shadow edge.
 
 ---
 
 ## Rendering
 
-### Trace/Shade Architecture (v1.1+)
+### Trace/Shade Architecture (v1.2.1)
 
-The renderer uses a two-kernel architecture to separate expensive geodesic integration from cheap coloring:
+The renderer uses a two-kernel architecture. The trace kernel records equatorial crossings and closest-approach distance. The shade kernel evaluates disk color with noise, ISCO glow, and Doppler every frame — animation is free.
 
 | Kernel | Cost | When | What |
 |--------|------|------|------|
-| `raytrace` | 50–200 ms | Camera moves | Traces geodesics, writes geometry buffer (hit type, disk crossings, exit angles) |
-| `shade` | 1–3 ms | Every frame | Reads g-buffer, computes colors with animated disk rotation, tone mapping, gamma |
+| `raytrace` | 100–400 ms | Camera moves | Traces geodesics (4000 steps), records crossing positions + min_r → g-buffer |
+| `shade` | 2–5 ms | Every frame | Evaluates noise + ISCO glow + Doppler at cached crossings, applies gravitational redshift to stars, tone mapping, gamma |
 
-When the camera is still, only the shade kernel runs — smooth animation at full resolution.
+When the camera is still, only the shade kernel runs — smooth 50+ FPS disk animation at full resolution. The 4000-step integration (vs 2000 in v1.2) resolves higher-order photon ring images but makes the initial trace slower.
 
 ### Resolution Tiers
 
@@ -385,7 +419,7 @@ When the camera is still, only the shade kernel runs — smooth animation at ful
 
 ### Star Field
 
-Two-layer procedural star field generated from hash functions in the shade kernel. Dense dim stars on a fine 400×200 grid with sparse bright stars on a coarse 120×60 grid. Both layers use 3×3 neighbor cell lookups to prevent star cutoff at cell boundaries. Gravitational lensing distortion is directly visible in the star positions.
+Two-layer procedural star field with 3×3 neighbor cell lookups to prevent cutoff artifacts. Stars near the black hole shadow edge are visibly reddened and dimmed by gravitational redshift — the shade kernel applies a frequency ratio g ≈ √(1 − r_h/r_min) based on each ray's closest approach to the horizon, shifting color toward red and reducing brightness as g³ (with green and blue dimming progressively faster).
 
 ---
 
@@ -412,13 +446,12 @@ If no GPU is detected, the simulation falls back to CPU computation with OpenMP 
 
 | Configuration | Resolution | Trace Time | Shade Time | Animation FPS |
 |--------------|------------|------------|------------|---------------|
-| Discrete GPU (RDNA3) | 1280×720 | 50–200 ms | 1–3 ms | smooth |
-| Discrete GPU (RDNA3) | 2560×1440 (60%) | 100–400 ms | 3–8 ms | ~50 |
-| Discrete GPU | 640×360 (drag) | 10–30 ms | <1 ms | Smooth |
-| Integrated GPU | 1280×720 | 500–2000 ms | 10–50 ms | Low |
-| CPU (8-core, OpenMP) | 1280×720 | 2–10 sec | N/A | No animation |
+| Discrete GPU (RDNA3) | 1280×720 | 100–400 ms | 2–5 ms | 50–60+ |
+| Discrete GPU (RDNA3) | 2560×1440 (70%) | 200–600 ms | 5–10 ms | ~50 |
+| Discrete GPU | 640×360 (drag) | 30–80 ms | <2 ms | Smooth |
+| CPU (8-core, OpenMP) | 1280×720 | 5–15 sec | N/A | No animation |
 
-The trace kernel (geodesic integration) is the expensive operation — up to 2000 RK4 steps per pixel. The shade kernel (coloring from cached g-buffer) is trivially fast and runs every frame for smooth disk animation.
+Trace is ~2× slower than v1.2 due to 4000 steps (vs 2000) with finer step sizes near the photon sphere. Animation remains at full framerate since noise, ISCO glow, and Doppler are evaluated in the shade kernel.
 
 ---
 
@@ -426,15 +459,18 @@ The trace kernel (geodesic integration) is the expensive operation — up to 200
 
 | Property | Accurate? | Notes |
 |----------|-----------|-------|
-| Metric | ✅ Exact Kerr | Boyer-Lindquist coordinates, spin a = 0.998 |
-| Geodesics | ✅ RK4 integrated | Hamiltonian formulation, adaptive step |
-| Lensing geometry | ✅ Yes | Multiple equatorial crossings captured |
+| Metric | ✅ Exact Kerr | Boyer-Lindquist coordinates, spin configurable |
+| Geodesics | ✅ RK4 integrated | Hamiltonian formulation, adaptive step, 4000 steps |
+| Lensing geometry | ✅ Yes | Higher-order images resolved (tertiary, quaternary) |
 | Photon sphere | ✅ Yes | Emerges from geodesic integration |
 | Frame dragging | ✅ Yes | ZAMO tetrad includes ω shift |
 | Doppler beaming | ✅ Approximate | Uses Keplerian v, simplified g-factor |
-| Disk emission | ❌ Simplified | T ∝ r^(-3/4), no radiative transfer |
-| Redshift | ❌ Partial | Doppler included, gravitational redshift approximate |
-| Disk thickness | ❌ Zero | Geometrically thin disk |
+| Disk thickness | ❌ Thin | Equatorial plane crossings, no volumetric RT |
+| Disk turbulence | ⚠️ Procedural | 3D FBM noise at crossings, not MHD-derived |
+| ISCO emission | ✅ Approximate | Emissivity spike at inner edge |
+| Gravitational redshift | ✅ Approximate | Stars redshifted by g ≈ √(1 − r_h/r_min) |
+| Disk emission | ❌ Simplified | T ∝ r^(−3/4), no full radiative transfer spectrum |
+| Polarization | ❌ Not modeled | No Stokes parameters |
 
 ---
 
@@ -442,19 +478,19 @@ The trace kernel (geodesic integration) is the expensive operation — up to 200
 
 | File | Lines | Description |
 |------|-------|-------------|
-| `main.cpp` | ~450 | GLFW window, OpenGL, camera controls, trace/shade render loop, post-processing |
-| `blackhole.h` | ~165 | SimConfig, Camera, GPURayTracer class, function declarations |
-| `blackhole.cpp` | ~1030 | GPU init, kernel management, CPU fallback, bloom, gamma LUT, HUD, screenshots, CLI parser |
-| `blackhole.cl` | ~490 | Two OpenCL kernels: `raytrace` (geodesic integration → g-buffer) and `shade` (g-buffer → pixels) |
+| `main.cpp` | 450 | GLFW window, OpenGL, camera controls, trace/shade render loop, post-processing |
+| `blackhole.h` | 167 | SimConfig, Camera, GPURayTracer class, function declarations |
+| `blackhole.cpp` | 1048 | GPU init, kernel management, CPU fallback, bloom, gamma LUT, HUD, screenshots, CLI parser |
+| `blackhole.cl` | 553 | Two OpenCL kernels: `raytrace` (4000-step geodesic integration → g-buffer) and `shade` (noise + ISCO + Doppler + redshift → pixels) |
 | `Makefile` | 62 | Cross-platform build with auto dependency detection |
 
 ---
 
 ## Known Limitations
 
-- **No gravitational redshift** on background stars — escaped photons are rendered at their original color without accounting for the energy change from climbing out of the potential well.
-- **Thin disk only** — a volumetric accretion flow (like a thick torus or ADAF) would produce different visual features but requires full radiative transfer.
+- **Procedural turbulence only** — disk structure comes from FBM noise, not from GRMHD simulation data. Visually convincing but not physically derived.
 - **No polarization** — real observations (e.g., the EHT image of M87*) show polarization patterns from the magnetic field structure, which this simulation does not model.
+- **Simplified radiative transfer** — emission and absorption coefficients are tuned for visual appearance, not derived from plasma physics (synchrotron, bremsstrahlung).
 - **Coordinate singularity at poles** — θ = 0 and θ = π are clamped to 0.01 rad to avoid division by zero in the metric components.
 - **GPU→CPU readback bottleneck** — pixel data is read back from GPU to CPU every frame for texture upload. OpenCL-GL interop (planned for v3.0) would eliminate this.
 

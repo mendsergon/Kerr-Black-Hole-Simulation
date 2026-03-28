@@ -268,7 +268,7 @@ bool GPURayTracer::createBuffers(int width, int height) {
 
     cl_int err;
 
-    // G-buffer: 4 float4s per pixel (geometry data)
+    // G-buffer: 4 float4s per pixel (crossing geometry + min_r)
     size_t gbufSize = width * height * 4 * sizeof(cl_float4);
     m_gbufBuffer = clCreateBuffer(m_context, CL_MEM_READ_WRITE, gbufSize, nullptr, &err);
     if (err != CL_SUCCESS) return false;
@@ -807,7 +807,7 @@ SimConfig parseArgs(int argc, char** argv) {
     for (int i = 1; i < argc; i++) {
         std::string arg = argv[i];
         if (arg == "--help" || arg == "-h") {
-            std::cout << "Kerr Black Hole Simulation v1.2\n\n"
+            std::cout << "Kerr Black Hole Simulation v1.2.1\n\n"
                       << "Usage: ./blackhole [options]\n\n"
                       << "Options:\n"
                       << "  --spin <float>       Spin parameter a/M (default: 0.998)\n"

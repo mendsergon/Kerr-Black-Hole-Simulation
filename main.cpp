@@ -176,7 +176,7 @@ int main(int argc, char** argv) {
     g_renderHeight = g_config.windowHeight;
 
     std::cout << "============================================" << std::endl;
-    std::cout << "  Kerr Black Hole Simulation v1.2" << std::endl;
+    std::cout << "  Kerr Black Hole Simulation v1.2.1" << std::endl;
     std::cout << "  Gravitational Lensing Ray Tracer" << std::endl;
     std::cout << "============================================" << std::endl;
     std::cout << std::endl;
@@ -303,10 +303,10 @@ int main(int argc, char** argv) {
         }
 
         // ================================================================
-        // Trace/Shade split architecture:
-        //   Camera moves → re-trace geodesics (expensive, ~50-200ms)
-        //   Camera still → shade only from cached g-buffer (cheap, ~1-3ms)
-        //   Disk animation runs in shade pass at full framerate
+        // Trace/Shade split:
+        //   Camera moves → re-trace geodesics (expensive)
+        //   Camera still → shade only from cached g-buffer (cheap, 60fps)
+        //   Disk animation (rotation, noise) runs in shade pass for free
         // ================================================================
 
         // Skip frame if window is minimized or invalid
@@ -316,7 +316,7 @@ int main(int argc, char** argv) {
             continue;
         }
 
-        // Determine render resolution
+        // Determine render resolution and whether to retrace
         float scale;
         bool doBloom = false;
         bool needTrace = false;
@@ -343,7 +343,7 @@ int main(int argc, char** argv) {
                 needTrace = !g_tracer.hasGeometry();
             }
         } else {
-            scale = 1.0f;
+            scale = 1.0f;  // Shade at full res — free
             needTrace = false;
         }
 
@@ -352,7 +352,7 @@ int main(int argc, char** argv) {
         rw = std::max(rw, 128);
         rh = std::max(rh, 72);
 
-        // GPU path: always force trace if g-buffer is stale or missing
+        // GPU path
         std::vector<float>* pixelPtr = nullptr;
         bool gotPixels = false;
 
@@ -362,8 +362,6 @@ int main(int argc, char** argv) {
                 g_tracer.traceGeometry(g_camera, rw, rh);
             }
             if (g_tracer.hasGeometry()) {
-                // Fast path: GPU applies tone map + gamma → zero CPU per-pixel work
-                // Bloom path: GPU outputs HDR → CPU does tone map + bloom + gamma
                 g_tracer.shadeFrame(rw, rh, g_simTime, !doBloom);
                 std::vector<float>& tpix = g_tracer.getPixels();
                 if (!tpix.empty() && (int)tpix.size() == rw * rh * 4) {
