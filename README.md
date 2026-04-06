@@ -446,7 +446,7 @@ If no GPU is detected, the simulation falls back to CPU computation with OpenMP 
 
 | Configuration | Resolution | Trace Time | Shade Time | Animation FPS |
 |--------------|------------|------------|------------|---------------|
-| Discrete GPU (RDNA3) | 1280×720 | 100–400 ms | 2–5 ms | 50–60+ |
+| Discrete GPU (RDNA3) | 1280×720 | 100–400 ms | 2–5 ms | Smooth |
 | Discrete GPU (RDNA3) | 2560×1440 (70%) | 200–600 ms | 5–10 ms | ~50 |
 | Discrete GPU | 640×360 (drag) | 30–80 ms | <2 ms | Smooth |
 | CPU (8-core, OpenMP) | 1280×720 | 5–15 sec | N/A | No animation |
